@@ -22,7 +22,17 @@ impl Agent for RouterAgent {
 
     async fn process(&self, messages: &[Message], _context: &serde_json::Value) -> Result<AgentOutput> {
         let system_prompt = format!(
-            "{}\n\nTareas:\n1. Clasifica la consulta del usuario.\n2. Intenciones posibles: ['educational', 'investigation'].\n3. Educational: Preguntas generales de mercado, terminología, 'cómo-hacer-algo'.\n4. Investigation: Empresas específicas, precios, noticias, análisis de acciones.\nDevuelve JSON: {{ \"intent\": \"educational\" | \"investigation\" }}",
+            "{}\n\nTareas:\n\
+            1. Clasifica la consulta del usuario.\n\
+            2. Intenciones posibles: ['educational', 'investigation'].\n\
+            3. Identifica si el usuario menciona empresas o tickers específicos.\n\
+            4. Si el usuario NO menciona empresas pero pide recomendaciones o búsquedas sobre un tema (ej. 'acciones de IA', 'ETFs de litio'), marca `requires_discovery: true` y pon el tema en `discovery_topic`.\n\n\
+            Devuelve JSON: {{ \n\
+                \"intent\": \"educational\" | \"investigation\", \n\
+                \"companies\": [\"AAPL\", \"MSFT\"], \n\
+                \"requires_discovery\": true | false, \n\
+                \"discovery_topic\": \"...\" \n\
+            }}",
             self.base.system_prompt
         );
 
@@ -49,12 +59,16 @@ impl Agent for RouterAgent {
             format: Some(json!({
                 "type": "object",
                 "properties": {
-                    "intent": { "type": "string", "enum": ["educational", "investigation"] }
+                    "intent": { "type": "string", "enum": ["educational", "investigation"] },
+                    "companies": { "type": "array", "items": { "type": "string" } },
+                    "requires_discovery": { "type": "boolean" },
+                    "discovery_topic": { "type": "string" }
                 },
-                "required": ["intent"]
+                "required": ["intent", "companies", "requires_discovery", "discovery_topic"]
             })),
             options: None,
         };
+
 
         let res = self.base.client.chat(req).await?;
         let data: serde_json::Value = crate::agents::parse_llm_json(&res.message.content)?;

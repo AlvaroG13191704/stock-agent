@@ -45,8 +45,10 @@ pub struct StockAction {
     pub company: String,
     pub ticker: String,
     pub reasoning: String,
+    pub sources: Option<Vec<String>>,
     pub prices: Option<PriceHistory>,
 }
+
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PriceHistory {

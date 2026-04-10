@@ -73,7 +73,7 @@ impl Orchestrator {
             self.client.clone(),
             &self.model,
             "Analizar si el usuario proporcionó información de perfil."
-        ));
+        ).with_trace(self.trace_log.clone()));
 
         if !profile.is_complete {
             self.add_trace("🧩 Agente Perfil: Analizando requisitos faltantes...");
@@ -91,20 +91,28 @@ impl Orchestrator {
             }
         }
 
+
         // 5. Intent Routing
         let router = RouterAgent::new(BaseAgent::new(
             "Router",
             self.client.clone(),
             &self.model,
             "Determinar la intención: educativa o investigación."
-        ));
+        ).with_trace(self.trace_log.clone()));
 
         self.add_trace("🔀 Agente Router: Identificando intención...");
         let router_out = router.process(&active_messages, &json!({})).await?;
-        let intent = if let AgentOutput::Structured(data) = router_out {
-            data["intent"].as_str().unwrap_or("educational").to_string()
+        let (intent, target_companies, requires_discovery, discovery_topic) = if let AgentOutput::Structured(data) = router_out {
+            (
+                data["intent"].as_str().unwrap_or("educational").to_string(),
+                data["companies"].as_array().map(|arr| {
+                    arr.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<String>>()
+                }).unwrap_or_default(),
+                data["requires_discovery"].as_bool().unwrap_or(false),
+                data["discovery_topic"].as_str().unwrap_or("").to_string()
+            )
         } else {
-            "educational".to_string()
+            ("educational".to_string(), vec![], false, "".to_string())
         };
         self.add_trace(&format!("Intención detectada: {}", intent));
 
@@ -116,26 +124,37 @@ impl Orchestrator {
                 self.client.clone(),
                 &self.model,
                 "Research market news."
-            ));
+            ).with_trace(self.trace_log.clone()));
+            
             let stock_data = StockDataAgent::new(BaseAgent::new(
                 "StockData",
                 self.client.clone(),
                 &self.model,
                 "Fetch historical prices."
-            ));
+            ).with_trace(self.trace_log.clone()));
 
             self.add_trace("🔍 Iniciando flujo de INVESTIGACIÓN...");
             
-            // Start step-by-step pipeline
-            let companies_to_research = if let Some(h) = &profile.holdings {
-                h.clone()
-            } else {
-                vec![query.clone()]
-            };
+            // Decidir qué empresas investigar
+            let mut companies_to_research = target_companies;
+            
+            // Si no hay empresas específicas y no es descubrimiento, usar perfil
+            if companies_to_research.is_empty() && !requires_discovery {
+                if let Some(h) = &profile.holdings {
+                    companies_to_research = h.clone();
+                    self.add_trace("Utilizando empresas del perfil para investigación.");
+                }
+            }
+
             self.add_trace(&format!("Empresas a investigar: {:?}", companies_to_research));
 
-            self.add_trace("📰 Agente NewsSearcher: Buscando noticias y sentimiento...");
-            let news_out = news_searcher.process(&active_messages, &json!({ "target_companies": companies_to_research })).await?;
+            self.add_trace("📰 Agente NewsSearcher: Procesando noticias...");
+            let news_out = news_searcher.process(&active_messages, &json!({ 
+                "target_companies": companies_to_research,
+                "requires_discovery": requires_discovery,
+                "discovery_topic": discovery_topic
+            })).await?;
+            
             let stock_actions = if let AgentOutput::Structured(data) = news_out {
                 data
             } else {
@@ -151,13 +170,17 @@ impl Orchestrator {
             };
 
             // Format investigate summary
-            self.add_trace("📝 Agente Formatter: Generando reporte ejecutivo (RESUMIDO)...");
+            self.add_trace("📝 Agente Formatter: Generando reporte ejecutivo...");
             let formatter = FormatterAgent::new(BaseAgent::new(
                 "Formatter",
                 self.client.clone(),
                 &self.model,
-                "Crea un resumen ejecutivo MUY CONCISO en Markdown premium. Usa una tabla simple para precios. Un párrafo corto para razonamiento. Sé directo, sin introducciones largas. Responde en ESPAÑOL."
-            ));
+                "Crea un resumen ejecutivo en Markdown premium. \
+                IMPORTANTE:\n\
+                1. Usa tablas formateadas profesionalmente.\n\
+                2. Si el resultado tiene 'sources', incluye los links al final de cada análisis como [Fuente](url).\n\
+                3. Sé directo y visualmente atractivo. Responde en ESPAÑOL."
+            ).with_trace(self.trace_log.clone()));
             
             let context = json!({ 
                 "investigative_results": final_results,
@@ -169,6 +192,7 @@ impl Orchestrator {
                 AgentOutput::Text(t) => t,
                 _ => "Investigación completada pero falló el formateo de los resultados.".to_string()
             }
+
         } else {
             // EDUCATIONAL FLOW
             self.add_trace("🎓 Iniciando flujo EDUCATIVO...");
@@ -177,13 +201,14 @@ impl Orchestrator {
                 self.client.clone(),
                 &self.model,
                 "Proporciona conocimientos educativos y generales sobre inversión. Responde en ESPAÑOL."
-            ));
+            ).with_trace(self.trace_log.clone()));
             let formatter = FormatterAgent::new(BaseAgent::new(
                 "Formatter",
                 self.client.clone(),
                 &self.model,
                 "Sintetiza la información educativa en ESPAÑOL."
-            ));
+            ).with_trace(self.trace_log.clone()));
+
 
             self.add_trace("💡 Agente Informer: Generando respuesta...");
             let informer_text = match informer.process(&active_messages, &json!({})).await? {

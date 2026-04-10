@@ -15,6 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use std::{io, sync::Arc};
+use chrono::Utc;
 use uuid::Uuid;
 
 pub struct App {
@@ -179,9 +180,18 @@ pub async fn run(orchestrator: Arc<Orchestrator>, storage: Arc<Storage>) -> Resu
                     KeyCode::PageDown => {
                         app.scroll_offset = app.scroll_offset.saturating_add(10);
                     }
-                    KeyCode::F(5) => {
+                    KeyCode::F(6) => {
                         // Reset profile
                         app.storage.delete_profile().await?;
+                        app.messages.push(Message {
+                            id: Uuid::new_v4(),
+                            conversation_id: app.current_conv_id.unwrap_or(Uuid::nil()),
+                            role: Role::System,
+                            content: "⚠️ Perfil Reiniciado. En la próxima consulta se volverá a pedir información si es necesario.".to_string(),
+                            created_at: Utc::now(),
+                            thinking: None,
+                        });
+                        app.is_loading = false;
                     }
                     _ => {}
                 }
@@ -200,9 +210,32 @@ pub async fn run(orchestrator: Arc<Orchestrator>, storage: Arc<Storage>) -> Resu
     Ok(())
 }
 
-fn format_markdown(text: &str) -> Vec<ratatui::text::Line> {
+fn format_markdown(text: &str) -> Vec<ratatui::text::Line<'_>> {
     let mut lines = Vec::new();
-    for line in text.lines() {
+    let raw_lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+
+    while i < raw_lines.len() {
+        let line = raw_lines[i];
+
+        if line.starts_with("|") && i + 1 < raw_lines.len() && raw_lines[i+1].contains("---") {
+            // Table detected
+            let mut table_rows = Vec::new();
+            let mut j = i;
+            while j < raw_lines.len() && raw_lines[j].starts_with("|") {
+                table_rows.push(raw_lines[j]);
+                j += 1;
+            }
+
+            if table_rows.len() >= 3 {
+                // We have a header, separator, and at least one data row
+                let rendered = render_premium_table(&table_rows);
+                lines.extend(rendered);
+                i = j;
+                continue;
+            }
+        }
+
         if line.starts_with("#") {
             // Header
             lines.push(ratatui::text::Line::from(vec![
@@ -212,11 +245,11 @@ fn format_markdown(text: &str) -> Vec<ratatui::text::Line> {
                 )
             ]));
         } else if line.contains("**") {
-            // Very simple Bold parser (one bold part per line for simplicity)
+            // Simple Bold parser
             let parts: Vec<&str> = line.split("**").collect();
             let mut spans = Vec::new();
-            for (i, part) in parts.into_iter().enumerate() {
-                if i % 2 == 1 {
+            for (idx, part) in parts.into_iter().enumerate() {
+                if idx % 2 == 1 {
                     spans.push(ratatui::text::Span::styled(part, Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)));
                 } else {
                     spans.push(ratatui::text::Span::raw(part));
@@ -226,9 +259,82 @@ fn format_markdown(text: &str) -> Vec<ratatui::text::Line> {
         } else {
             lines.push(ratatui::text::Line::raw(line));
         }
+        i += 1;
     }
     lines
 }
+
+fn render_premium_table(raw_rows: &[&str]) -> Vec<ratatui::text::Line<'static>> {
+    let mut grid: Vec<Vec<String>> = Vec::new();
+    for row in raw_rows {
+        if row.contains("---") { continue; } // Skip separator
+        let cols: Vec<String> = row.split('|')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .collect();
+        if !cols.is_empty() {
+            grid.push(cols);
+        }
+    }
+
+    if grid.is_empty() { return vec![]; }
+
+    let num_cols = grid[0].len();
+    let mut col_widths = vec![0; num_cols];
+    for row in &grid {
+        for (idx, col) in row.iter().enumerate() {
+            if idx < num_cols {
+                col_widths[idx] = col_widths[idx].max(col.len());
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    
+    // Top border
+    let mut top = String::from("┌");
+    for (idx, &w) in col_widths.iter().enumerate() {
+        top.push_str(&"─".repeat(w + 2));
+        if idx < num_cols - 1 { top.push('┬'); } else { top.push('┐'); }
+    }
+    result.push(ratatui::text::Line::from(ratatui::text::Span::styled(top, Style::default().fg(Color::DarkGray))));
+
+    for (row_idx, row) in grid.iter().enumerate() {
+        let mut line_content = String::from("│");
+        for (col_idx, &w) in col_widths.iter().enumerate() {
+            let val = row.get(col_idx).cloned().unwrap_or_default();
+            line_content.push_str(&format!(" {:<width$} │", val, width = w));
+        }
+        
+        let style = if row_idx == 0 {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        result.push(ratatui::text::Line::from(ratatui::text::Span::styled(line_content, style)));
+
+        // Separator after header
+        if row_idx == 0 {
+            let mut sep = String::from("├");
+            for (idx, &w) in col_widths.iter().enumerate() {
+                sep.push_str(&"─".repeat(w + 2));
+                if idx < num_cols - 1 { sep.push('┼'); } else { sep.push('┤'); }
+            }
+            result.push(ratatui::text::Line::from(ratatui::text::Span::styled(sep, Style::default().fg(Color::DarkGray))));
+        }
+    }
+
+    // Bottom border
+    let mut bottom = String::from("└");
+    for (idx, &w) in col_widths.iter().enumerate() {
+        bottom.push_str(&"─".repeat(w + 2));
+        if idx < num_cols - 1 { bottom.push('┴'); } else { bottom.push('┘'); }
+    }
+    result.push(ratatui::text::Line::from(ratatui::text::Span::styled(bottom, Style::default().fg(Color::DarkGray))));
+
+    result
+}
+
 
 fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -255,7 +361,7 @@ fn ui(f: &mut Frame, app: &App) {
     };
 
     let header = Paragraph::new(format!(
-        "Chat: {} (Tab Switch, F2 Nuevo, F4 Borrar, F5 Reset Perfil, ESC Salir)",
+        "Chat: {} (Tab Switch, F2 Nuevo, F4 Borrar, F6 Reset Perfil, ESC Salir)",
         title
     ))
     .style(Style::default().fg(Color::Yellow))

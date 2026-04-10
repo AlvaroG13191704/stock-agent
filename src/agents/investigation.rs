@@ -22,16 +22,53 @@ impl Agent for NewsSearcherAgent {
     }
 
     async fn process(&self, _messages: &[Message], context: &serde_json::Value) -> Result<AgentOutput> {
-        let companies = context["target_companies"].as_array().map(|arr| {
+        let mut companies = context["target_companies"].as_array().map(|arr| {
             arr.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<String>>()
         }).unwrap_or_default();
+
+        let requires_discovery = context["requires_discovery"].as_bool().unwrap_or(false);
+        let discovery_topic = context["discovery_topic"].as_str().unwrap_or("");
+
+        if requires_discovery && !discovery_topic.is_empty() {
+             self.base.add_trace(&format!("Buscando nuevos activos para el tema: {}", discovery_topic));
+             let disc_query = format!("Identify top 3-4 stock tickers or ETFs for {}", discovery_topic);
+             let search_res = self.base.client.web_search(disc_query).await?;
+             let mut disc_text = String::new();
+             for item in search_res.results.iter().take(5) {
+                 disc_text.push_str(&format!("- {}\n", item.content));
+             }
+
+             let req = crate::ollama::ChatRequest {
+                model: self.base.model.clone(),
+                messages: vec![crate::ollama::ChatMessage {
+                    role: "system".to_string(),
+                    content: format!("Basado en los resultados de búsqueda, identifica los 3-4 tickers más relevantes para {}. Devuelve SOLO un array JSON de strings con los tickers.", discovery_topic),
+                    images: None,
+                }, crate::ollama::ChatMessage {
+                    role: "user".to_string(),
+                    content: disc_text,
+                    images: None,
+                }],
+                stream: false,
+                format: Some(json!({ "type": "array", "items": { "type": "string" } })),
+                options: None,
+            };
+            let res = self.base.client.chat(req).await?;
+            let discovered: Vec<String> = crate::agents::parse_llm_json(&res.message.content)?;
+            companies.extend(discovered);
+            // Deduplicate
+            companies.sort();
+            companies.dedup();
+        }
 
         let mut results = Vec::new();
         for company in companies {
             let query = format!("latest stock news and market sentiment for {} {}", company, company);
             let search_res = self.base.client.web_search(query).await?;
             let mut news_text = String::new();
+            let mut sources = Vec::new();
             for item in search_res.results.iter().take(3) {
+                sources.push(item.url.clone());
                 news_text.push_str(&format!("Source: {}\nContent: {}\n", item.url, item.content));
             }
 
@@ -60,13 +97,15 @@ impl Agent for NewsSearcherAgent {
                 options: None,
             };
             let res = self.base.client.chat(req).await?;
-            let stock_action: StockAction = crate::agents::parse_llm_json(&res.message.content)?;
+            let mut stock_action: StockAction = crate::agents::parse_llm_json(&res.message.content)?;
+            stock_action.sources = Some(sources);
             results.push(stock_action);
         }
 
         Ok(AgentOutput::Structured(json!(results)))
     }
 }
+
 
 /// Fetches price history info (today, 1w, 1y) via web search
 pub struct StockDataAgent {
