@@ -46,6 +46,12 @@ graph TD
     FinalOutput --> Store
 ```
 
+## Ciclo de vida y tolerancia a fallos
+
+Cada consulta recibe un `run_id` y se persiste en la tabla `runs`. El orquestador emite eventos de inicio, trazabilidad, finalización o error mediante un canal asíncrono hacia la TUI. Las ejecuciones tienen un límite total de cinco minutos y pueden cancelarse al salir, cambiar de conversación o borrar un chat. Si la aplicación se cierra inesperadamente, los runs que quedaron en estado `running` se marcan como fallidos al iniciar.
+
+La capa HTTP también aplica timeouts de conexión y de respuesta. Los errores de agentes o de persistencia ya no se descartan: se registran y se muestran al usuario.
+
 ## Detalles de los Componentes
 
 ### 1. Gestor de Contexto

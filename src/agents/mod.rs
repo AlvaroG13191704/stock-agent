@@ -1,35 +1,50 @@
-use anyhow::{Result, Context, anyhow};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use crate::ollama::OllamaClient;
-use crate::models::Message;
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
+use uuid::Uuid;
+
+use crate::events::RunEvent;
+use crate::models::Message;
+use crate::ollama::OllamaClient;
 
 pub fn parse_llm_json<T: serde::de::DeserializeOwned>(content: &str) -> Result<T> {
-    let start = content.find('{');
-    let end = content.rfind('}');
+    let trimmed = content.trim();
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return Ok(value);
+    }
 
-    match (start, end) {
-        (Some(s), Some(e)) if e > s => {
-            let json_str = &content[s..=e];
-            serde_json::from_str(json_str)
-                .with_context(|| format!("Failed to parse extracted JSON from LLM.\nEXTRACTED: {}", json_str))
-        }
-        _ => {
-             // Fallback to original logic if no braces found (maybe it's a list [])
-             let start_arr = content.find('[');
-             let end_arr = content.rfind(']');
-             match (start_arr, end_arr) {
-                 (Some(s), Some(e)) if e > s => {
-                     let json_str = &content[s..=e];
-                     serde_json::from_str(json_str)
-                        .with_context(|| format!("Failed to parse extracted JSON Array from LLM.\nEXTRACTED: {}", json_str))
-                 }
-                 _ => Err(anyhow!("No JSON braces or brackets found in LLM response: {}", content))
-             }
+    for block in trimmed.split("```").skip(1).step_by(2) {
+        let json_block = block
+            .strip_prefix("json")
+            .or_else(|| block.strip_prefix("JSON"))
+            .unwrap_or(block)
+            .trim();
+        if let Ok(value) = serde_json::from_str(json_block) {
+            return Ok(value);
         }
     }
+
+    for (index, character) in content.char_indices() {
+        if !matches!(character, '{' | '[') {
+            continue;
+        }
+
+        let mut stream = serde_json::Deserializer::from_str(&content[index..]).into_iter::<T>();
+        if let Some(Ok(value)) = stream.next() {
+            return Ok(value);
+        }
+    }
+
+    Err(anyhow!(
+        "No valid JSON value found in LLM response: {}",
+        truncate_response(content)
+    ))
 }
 
+fn truncate_response(content: &str) -> String {
+    content.chars().take(2_000).collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -43,40 +58,67 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_clean_json() {
+    fn parse_clean_json() {
         let input = r#"{"name": "test", "value": 42}"#;
-        let parsed: TestData = parse_llm_json(input).unwrap();
-        assert_eq!(parsed, TestData { name: "test".to_string(), value: 42 });
+        let parsed: TestData = parse_llm_json(input).expect("clean JSON should parse");
+        assert_eq!(
+            parsed,
+            TestData {
+                name: "test".to_string(),
+                value: 42
+            }
+        );
     }
 
     #[test]
-    fn test_parse_json_with_markdown_block() {
+    fn parse_json_with_markdown_block() {
         let input = "Aquí está el JSON:\n```json\n{\"name\": \"test\", \"value\": 42}\n```\nEspero que sirva.";
-        let parsed: TestData = parse_llm_json(input).expect("Should find JSON in block");
-        assert_eq!(parsed, TestData { name: "test".to_string(), value: 42 });
+        let parsed: TestData = parse_llm_json(input).expect("JSON code block should parse");
+        assert_eq!(
+            parsed,
+            TestData {
+                name: "test".to_string(),
+                value: 42
+            }
+        );
     }
 
     #[test]
-    fn test_parse_json_array() {
+    fn parse_json_array() {
         let input = "Resultados: [\"A\", \"B\", \"C\"]";
-        let parsed: Vec<String> = parse_llm_json(input).expect("Should find Array in text");
-        assert_eq!(parsed, vec!["A".to_string(), "B".to_string(), "C".to_string()]);
+        let parsed: Vec<String> = parse_llm_json(input).expect("JSON array should parse");
+        assert_eq!(
+            parsed,
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_json_with_braces_inside_string() {
+        let input = r#"Respuesta: {"name":"{quoted}","value":42}"#;
+        let parsed: TestData = parse_llm_json(input).expect("braces inside strings should parse");
+        assert_eq!(parsed.name, "{quoted}");
     }
 }
 
-
-
-pub mod informer;
 pub mod formatter;
-pub mod router;
-pub mod profile;
+pub mod informer;
 pub mod investigation;
+pub mod profile;
+pub mod router;
 
 #[async_trait]
 pub trait Agent: Send + Sync {
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Agent names are part of the public orchestration contract"
+    )]
     fn name(&self) -> &str;
-    async fn process(&self, messages: &[Message], context: &serde_json::Value) -> Result<AgentOutput>;
+    async fn process(
+        &self,
+        messages: &[Message],
+        context: &serde_json::Value,
+    ) -> Result<AgentOutput>;
 }
 
 pub enum AgentOutput {
@@ -85,12 +127,12 @@ pub enum AgentOutput {
 }
 
 pub struct BaseAgent {
-    #[allow(dead_code)]
     pub name: String,
     pub client: Arc<OllamaClient>,
     pub model: String,
     pub system_prompt: String,
-    pub trace_log: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    run_id: Option<Uuid>,
+    event_tx: Option<UnboundedSender<RunEvent>>,
 }
 
 impl BaseAgent {
@@ -100,23 +142,26 @@ impl BaseAgent {
             client,
             model: model.to_string(),
             system_prompt: system_prompt.to_string(),
-            trace_log: None,
+            run_id: None,
+            event_tx: None,
         }
     }
 
-    pub fn with_trace(mut self, trace: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
-        self.trace_log = Some(trace);
+    pub fn with_events(mut self, run_id: Uuid, event_tx: UnboundedSender<RunEvent>) -> Self {
+        self.run_id = Some(run_id);
+        self.event_tx = Some(event_tx);
         self
     }
 
-    pub fn add_trace(&self, msg: &str) {
-        if let Some(trace) = &self.trace_log {
-            if let Ok(mut logs) = trace.lock() {
-                let offset = chrono::FixedOffset::west_opt(6 * 3600).unwrap();
-                let now = chrono::Utc::now().with_timezone(&offset);
-                logs.push(format!("[{}] {}", now.format("%H:%M:%S"), msg));
-            }
-        }
+    pub fn add_trace(&self, message: &str) {
+        let (Some(run_id), Some(event_tx)) = (self.run_id, &self.event_tx) else {
+            return;
+        };
+
+        let timestamp = chrono::Utc::now().format("%H:%M:%S");
+        let _ = event_tx.send(RunEvent::Trace {
+            run_id,
+            message: format!("[{timestamp}] {}: {message}", self.name),
+        });
     }
 }
-

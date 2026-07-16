@@ -1,7 +1,7 @@
+use crate::agents::{Agent, AgentOutput, BaseAgent};
+use crate::models::Message;
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::agents::{Agent, AgentOutput, BaseAgent};
-use crate::models::{Message};
 use serde_json::json;
 
 pub struct RouterAgent {
@@ -20,7 +20,11 @@ impl Agent for RouterAgent {
         &self.base.name
     }
 
-    async fn process(&self, messages: &[Message], _context: &serde_json::Value) -> Result<AgentOutput> {
+    async fn process(
+        &self,
+        messages: &[Message],
+        _context: &serde_json::Value,
+    ) -> Result<AgentOutput> {
         let system_prompt = format!(
             "{}\n\nTareas:\n\
             1. Clasifica la consulta del usuario.\n\
@@ -36,13 +40,11 @@ impl Agent for RouterAgent {
             self.base.system_prompt
         );
 
-        let mut chat_messages: Vec<crate::ollama::ChatMessage> = vec![
-            crate::ollama::ChatMessage {
-                role: "system".to_string(),
-                content: system_prompt,
-                images: None,
-            }
-        ];
+        let mut chat_messages: Vec<crate::ollama::ChatMessage> = vec![crate::ollama::ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+            images: None,
+        }];
 
         for msg in messages.iter().rev().take(5).rev() {
             chat_messages.push(crate::ollama::ChatMessage {
@@ -68,7 +70,6 @@ impl Agent for RouterAgent {
             })),
             options: None,
         };
-
 
         let res = self.base.client.chat(req).await?;
         let data: serde_json::Value = crate::agents::parse_llm_json(&res.message.content)?;

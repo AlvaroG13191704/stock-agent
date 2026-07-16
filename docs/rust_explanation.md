@@ -9,7 +9,7 @@ El programa utiliza el runtime de **Tokio** (`#[tokio::main]`), que permite ejec
 
 ## 2. Persistencia (`storage.rs`)
 Utiliza **SQLx** para interactuar con SQLite de forma asíncrona.
-- **Migraciones**: Al iniciar, verifica que existan las tablas `conversations`, `messages` y `user_profiles`.
+- **Migraciones**: Al iniciar, ejecuta las migraciones versionadas de `migrations/`, conservando los datos existentes y creando las tablas `conversations`, `messages`, `user_profiles` y `runs`.
 - **Manejo de UUIDs**: Cada mensaje y conversación tiene un identificador único (UUID).
 - **Perfiles de Usuario**: Almacena las holdings (acciones) como un array JSON en la columna de texto.
 
@@ -34,7 +34,7 @@ Esto le dice a Rust: *"Cualquier cosa que quiera ser un Agente debe tener un nom
 4. **`Send + Sync`**: Al añadir estos requisitos al trait, garantizamos que nuestros agentes puedan moverse entre diferentes hilos de ejecución de forma segura, lo cual es vital para una aplicación asíncrona impulsada por Tokio.
 
 ## 4. El Orquestador (`orchestrator.rs`)
-Es el cerebro que coordina el flujo. Su método principal `handle_query` sigue estos pasos:
+Es el cerebro que coordina el flujo. Cada consulta recibe un `run_id`, un canal de eventos y un token de cancelación. El método `handle_query` tiene un límite total de ejecución de cinco minutos y registra el estado del run (`running`, `completed` o `failed`) en SQLite.
 1. **Compresión de Contexto**: Si hay más de 10 mensajes, llama al LLM para resumir la historia antigua, manteniendo solo los últimos mensajes "frescos" para no saturar la ventana de tokens (250k).
 2. **Perfilamiento**: Verifica si el perfil del usuario está completo. Si no, fuerza al `ProfileAgent` a hablar.
 3. **Enrutamiento**: El `RouterAgent` decide si la pregunta es "Educativa" o una "Investigación".
@@ -42,8 +42,10 @@ Es el cerebro que coordina el flujo. Su método principal `handle_query` sigue e
    - `HoldingAnalyzer` -> `NewsSearcher` -> `StockData` -> `Formatter`.
 
 ## 5. Interfaz de Terminal (`ui.rs`)
-Utiliza **Ratatui** para renderizar la interfaz y **Crossterm** para capturar eventos del teclado.
+Utiliza `Ratatui` para renderizar la interfaz y `Crossterm` para capturar eventos del teclado.
 - **Event Loop**: Un bucle `while` que escucha teclas como `TAB` (cambiar conversación), `F2` (nuevo chat) o `Enter` (enviar mensaje).
+- **Eventos de ejecución**: La UI recibe eventos con `run_id` mediante un canal asíncrono. Esto permite mostrar trazas, finalizar el estado de carga y mostrar errores sin consultar una traza global compartida.
+- **Cancelación**: Al salir, cambiar de conversación o borrar un chat, se cancela el run activo mediante `CancellationToken`.
 - **Async Execution**: Cuando envías un mensaje, se lanza una tarea asíncrona para que la interfaz no se congele mientras el agente piensa o busca en la web.
 
 ## 6. Modelado de Datos (`models.rs`)
@@ -53,10 +55,11 @@ Define estructuras claras usando **Serde** (`Serialize/Deserialize`).
 ---
 
 ### Resumen del Ciclo de Vida de una Pregunta:
-1. **Usuario teclea** -> `ui.rs` captura el Enter.
-2. **UI envía query** -> `orchestrator.rs` recibe la petición.
+1. **Usuario teclea** -> `ui.rs` captura el Enter y crea un `run_id`.
+2. **UI envía query** -> `orchestrator.rs` registra el run y emite eventos de progreso.
 3. **Orquestador analiza perfil** -> Si falta info, pide al usuario.
 4. **Orquestador analiza intención** -> Decide qué agentes especializados usar.
-5. **Agentes buscan en Web** -> `OllamaClient` hace peticiones HTTP a la nube.
+5. **Agentes buscan en Web** -> `OllamaClient` hace peticiones HTTP con timeouts.
 6. **Formateador une todo** -> Genera el Markdown final.
-7. **UI renderiza** -> El usuario ve la respuesta en colores.
+7. **Run finaliza** -> Se registra como completado o fallido; la UI siempre libera el estado de carga.
+8. **UI renderiza** -> El usuario ve la respuesta y la trazabilidad en colores.

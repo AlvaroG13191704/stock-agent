@@ -1,8 +1,8 @@
-use anyhow::Result;
-use async_trait::async_trait;
 use crate::agents::{Agent, AgentOutput, BaseAgent};
 use crate::models::Message;
-use crate::ollama::{ChatRequest, ChatMessage};
+use crate::ollama::{ChatMessage, ChatRequest};
+use anyhow::Result;
+use async_trait::async_trait;
 
 pub struct InformerAgent {
     pub base: BaseAgent,
@@ -20,8 +20,12 @@ impl Agent for InformerAgent {
         &self.base.name
     }
 
-    async fn process(&self, messages: &[Message], _context: &serde_json::Value) -> Result<AgentOutput> {
-         let mut chat_messages: Vec<ChatMessage> = Vec::new();
+    async fn process(
+        &self,
+        messages: &[Message],
+        _context: &serde_json::Value,
+    ) -> Result<AgentOutput> {
+        let mut chat_messages: Vec<ChatMessage> = Vec::new();
         chat_messages.push(ChatMessage {
             role: "system".to_string(),
             content: self.base.system_prompt.clone(),
@@ -30,7 +34,9 @@ impl Agent for InformerAgent {
 
         for msg in messages {
             chat_messages.push(ChatMessage {
-                role: serde_json::to_string(&msg.role)?.trim_matches('"').to_string(),
+                role: serde_json::to_string(&msg.role)?
+                    .trim_matches('"')
+                    .to_string(),
                 content: msg.content.clone(),
                 images: None,
             });

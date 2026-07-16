@@ -1,7 +1,9 @@
+use crate::events::RunEvent;
 use crate::models::{Conversation, Message, Role};
 use crate::orchestrator::Orchestrator;
 use crate::storage::Storage;
 use anyhow::Result;
+use chrono::Utc;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -15,7 +17,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use std::{io, sync::Arc};
-use chrono::Utc;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub struct App {
@@ -26,6 +29,11 @@ pub struct App {
     conversations: Vec<Conversation>,
     current_conv_id: Option<Uuid>,
     is_loading: bool,
+    active_run: Option<Uuid>,
+    cancellation: Option<CancellationToken>,
+    event_tx: UnboundedSender<RunEvent>,
+    event_rx: UnboundedReceiver<RunEvent>,
+    trace_log: Vec<String>,
     pub scroll_offset: u16,
 }
 
@@ -39,6 +47,8 @@ impl App {
             Vec::new()
         };
 
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+
         Ok(Self {
             orchestrator,
             storage,
@@ -47,12 +57,17 @@ impl App {
             conversations,
             current_conv_id,
             is_loading: false,
+            active_run: None,
+            cancellation: None,
+            event_tx,
+            event_rx,
+            trace_log: Vec::new(),
             scroll_offset: 0,
         })
     }
 
     pub async fn send_message(&mut self) -> Result<()> {
-        if self.input.is_empty() || self.is_loading {
+        if self.input.trim().is_empty() || self.is_loading {
             return Ok(());
         }
 
@@ -65,32 +80,97 @@ impl App {
             conv.id
         };
 
-        let query = self.input.clone();
+        let query = self.input.trim().to_string();
         self.input.clear();
         self.is_loading = true;
+        self.trace_log.clear();
+
+        let run_id = Uuid::new_v4();
+        let cancellation = CancellationToken::new();
+        self.active_run = Some(run_id);
+        self.cancellation = Some(cancellation.clone());
 
         let orchestrator = self.orchestrator.clone();
-        
-        // Spawn the heavy work in the background so the UI doesn't freeze
+        let event_tx = self.event_tx.clone();
         tokio::spawn(async move {
-            let _ = orchestrator.handle_query(conv_id, query).await;
+            let _ = orchestrator
+                .handle_query(conv_id, query, run_id, cancellation, event_tx)
+                .await;
         });
 
-        self.scroll_offset = 0; // Reset scroll on new message
+        self.scroll_offset = 0;
         Ok(())
+    }
+
+    pub fn process_events(&mut self) {
+        while let Ok(event) = self.event_rx.try_recv() {
+            match event {
+                RunEvent::Started {
+                    run_id,
+                    conversation_id,
+                } => {
+                    if self.active_run == Some(run_id)
+                        && self.current_conv_id == Some(conversation_id)
+                    {
+                        self.is_loading = true;
+                    }
+                }
+                RunEvent::Trace { run_id, message } => {
+                    if self.active_run == Some(run_id) {
+                        self.trace_log.push(message);
+                        if self.trace_log.len() > 30 {
+                            self.trace_log.remove(0);
+                        }
+                    }
+                }
+                RunEvent::Completed {
+                    run_id,
+                    conversation_id,
+                } => {
+                    if self.active_run == Some(run_id)
+                        && self.current_conv_id == Some(conversation_id)
+                    {
+                        self.is_loading = false;
+                        self.active_run = None;
+                        self.cancellation = None;
+                    }
+                }
+                RunEvent::Failed {
+                    run_id,
+                    conversation_id,
+                    message,
+                } => {
+                    if self.active_run == Some(run_id) {
+                        self.is_loading = false;
+                        self.active_run = None;
+                        self.cancellation = None;
+                        self.messages.push(Message {
+                            id: Uuid::new_v4(),
+                            conversation_id,
+                            role: Role::System,
+                            content: format!("⚠️ No se pudo completar la consulta: {message}"),
+                            created_at: Utc::now(),
+                            thinking: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn cancel_active_run(&mut self) {
+        if let Some(cancellation) = self.cancellation.take() {
+            cancellation.cancel();
+        }
+        self.active_run = None;
+        self.is_loading = false;
     }
 
     pub async fn refresh_messages(&mut self) -> Result<()> {
         if let Some(id) = self.current_conv_id {
             let new_messages = self.storage.get_messages(id).await?;
-            if new_messages.len() != self.messages.len() {
+            if new_messages.len() > self.messages.len() {
                 self.messages = new_messages;
-                // If last message is Assistant, processing is likely done
-                if let Some(last) = self.messages.last() {
-                    if last.role == Role::Assistant {
-                        self.is_loading = false;
-                    }
-                }
             }
         }
         Ok(())
@@ -100,6 +180,7 @@ impl App {
         if self.conversations.is_empty() {
             return Ok(());
         }
+        self.cancel_active_run();
         let idx = self
             .conversations
             .iter()
@@ -109,6 +190,7 @@ impl App {
         let next_id = self.conversations[next_idx].id;
         self.current_conv_id = Some(next_id);
         self.messages = self.storage.get_messages(next_id).await?;
+        self.trace_log.clear();
         Ok(())
     }
 }
@@ -123,67 +205,70 @@ pub async fn run(orchestrator: Arc<Orchestrator>, storage: Arc<Storage>) -> Resu
     let mut app = App::new(orchestrator, storage).await?;
 
     loop {
-        terminal.draw(|f| ui(f, &app))?;
-        
-        // Periodically refresh messages to show user input and AI response
+        app.process_events();
         app.refresh_messages().await?;
+        terminal.draw(|f| ui(f, &app))?;
 
-        if event::poll(std::time::Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Esc => break,
-                    KeyCode::Enter => {
-                        app.send_message().await?;
-                    }
-                    KeyCode::Char(c) => {
-                        app.input.push(c);
-                    }
-                    KeyCode::Backspace => {
-                        app.input.pop();
-                    }
-                    KeyCode::Tab => {
-                        app.next_conv().await?;
-                    }
-                    KeyCode::F(2) => {
-                        // New conversation
-                        let conv = app.storage.create_conversation("Nuevo Chat").await?;
-                        app.current_conv_id = Some(conv.id);
+        if event::poll(std::time::Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()?
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    app.cancel_active_run();
+                    break;
+                }
+                KeyCode::Enter => {
+                    app.send_message().await?;
+                }
+                KeyCode::Char(c) => {
+                    app.input.push(c);
+                }
+                KeyCode::Backspace => {
+                    app.input.pop();
+                }
+                KeyCode::Tab => {
+                    app.next_conv().await?;
+                }
+                KeyCode::F(2) => {
+                    app.cancel_active_run();
+                    let conv = app.storage.create_conversation("Nuevo Chat").await?;
+                    app.current_conv_id = Some(conv.id);
+                    app.conversations = app.storage.list_conversations().await?;
+                    app.messages = Vec::new();
+                    app.trace_log.clear();
+                }
+                KeyCode::Delete | KeyCode::F(4) => {
+                    app.cancel_active_run();
+                    if let Some(id) = app.current_conv_id {
+                        app.storage.delete_conversation(id).await?;
                         app.conversations = app.storage.list_conversations().await?;
-                        app.messages = Vec::new();
-                        app.is_loading = false;
-                    }
-                    KeyCode::Delete | KeyCode::F(4) => {
-                        // Delete current conversation
-                        if let Some(id) = app.current_conv_id {
-                            app.storage.delete_conversation(id).await?;
-                            app.conversations = app.storage.list_conversations().await?;
-                            app.current_conv_id = app.conversations.first().map(|c| c.id);
-                            if let Some(new_id) = app.current_conv_id {
-                                app.messages = app.storage.get_messages(new_id).await?;
-                            } else {
-                                app.messages = Vec::new();
-                            }
-                            app.is_loading = false;
+                        app.current_conv_id = app.conversations.first().map(|c| c.id);
+                        if let Some(new_id) = app.current_conv_id {
+                            app.messages = app.storage.get_messages(new_id).await?;
+                        } else {
+                            app.messages = Vec::new();
                         }
+                        app.trace_log.clear();
                     }
-                    KeyCode::Up => {
-                        if app.scroll_offset > 0 {
-                            app.scroll_offset -= 1;
-                        }
+                }
+                KeyCode::Up => {
+                    if app.scroll_offset > 0 {
+                        app.scroll_offset -= 1;
                     }
-                    KeyCode::Down => {
-                        app.scroll_offset += 1;
-                    }
-                    KeyCode::PageUp => {
-                        app.scroll_offset = app.scroll_offset.saturating_sub(10);
-                    }
-                    KeyCode::PageDown => {
-                        app.scroll_offset = app.scroll_offset.saturating_add(10);
-                    }
-                    KeyCode::F(6) => {
-                        // Reset profile
-                        app.storage.delete_profile().await?;
-                        app.messages.push(Message {
+                }
+                KeyCode::Down => {
+                    app.scroll_offset += 1;
+                }
+                KeyCode::PageUp => {
+                    app.scroll_offset = app.scroll_offset.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    app.scroll_offset = app.scroll_offset.saturating_add(10);
+                }
+                KeyCode::F(6) => {
+                    app.cancel_active_run();
+                    app.storage.delete_profile().await?;
+                    app.messages.push(Message {
                             id: Uuid::new_v4(),
                             conversation_id: app.current_conv_id.unwrap_or(Uuid::nil()),
                             role: Role::System,
@@ -191,10 +276,8 @@ pub async fn run(orchestrator: Arc<Orchestrator>, storage: Arc<Storage>) -> Resu
                             created_at: Utc::now(),
                             thinking: None,
                         });
-                        app.is_loading = false;
-                    }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
@@ -218,7 +301,7 @@ fn format_markdown(text: &str) -> Vec<ratatui::text::Line<'_>> {
     while i < raw_lines.len() {
         let line = raw_lines[i];
 
-        if line.starts_with("|") && i + 1 < raw_lines.len() && raw_lines[i+1].contains("---") {
+        if line.starts_with("|") && i + 1 < raw_lines.len() && raw_lines[i + 1].contains("---") {
             // Table detected
             let mut table_rows = Vec::new();
             let mut j = i;
@@ -241,8 +324,10 @@ fn format_markdown(text: &str) -> Vec<ratatui::text::Line<'_>> {
             lines.push(ratatui::text::Line::from(vec![
                 ratatui::text::Span::styled(
                     line,
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                )
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]));
         } else if line.contains("**") {
             // Simple Bold parser
@@ -250,7 +335,12 @@ fn format_markdown(text: &str) -> Vec<ratatui::text::Line<'_>> {
             let mut spans = Vec::new();
             for (idx, part) in parts.into_iter().enumerate() {
                 if idx % 2 == 1 {
-                    spans.push(ratatui::text::Span::styled(part, Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)));
+                    spans.push(ratatui::text::Span::styled(
+                        part,
+                        Style::default()
+                            .add_modifier(Modifier::BOLD)
+                            .fg(Color::Cyan),
+                    ));
                 } else {
                     spans.push(ratatui::text::Span::raw(part));
                 }
@@ -267,8 +357,11 @@ fn format_markdown(text: &str) -> Vec<ratatui::text::Line<'_>> {
 fn render_premium_table(raw_rows: &[&str]) -> Vec<ratatui::text::Line<'static>> {
     let mut grid: Vec<Vec<String>> = Vec::new();
     for row in raw_rows {
-        if row.contains("---") { continue; } // Skip separator
-        let cols: Vec<String> = row.split('|')
+        if row.contains("---") {
+            continue;
+        } // Skip separator
+        let cols: Vec<String> = row
+            .split('|')
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.trim().to_string())
             .collect();
@@ -277,7 +370,9 @@ fn render_premium_table(raw_rows: &[&str]) -> Vec<ratatui::text::Line<'static>> 
         }
     }
 
-    if grid.is_empty() { return vec![]; }
+    if grid.is_empty() {
+        return vec![];
+    }
 
     let num_cols = grid[0].len();
     let mut col_widths = vec![0; num_cols];
@@ -290,14 +385,21 @@ fn render_premium_table(raw_rows: &[&str]) -> Vec<ratatui::text::Line<'static>> 
     }
 
     let mut result = Vec::new();
-    
+
     // Top border
     let mut top = String::from("┌");
     for (idx, &w) in col_widths.iter().enumerate() {
         top.push_str(&"─".repeat(w + 2));
-        if idx < num_cols - 1 { top.push('┬'); } else { top.push('┐'); }
+        if idx < num_cols - 1 {
+            top.push('┬');
+        } else {
+            top.push('┐');
+        }
     }
-    result.push(ratatui::text::Line::from(ratatui::text::Span::styled(top, Style::default().fg(Color::DarkGray))));
+    result.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+        top,
+        Style::default().fg(Color::DarkGray),
+    )));
 
     for (row_idx, row) in grid.iter().enumerate() {
         let mut line_content = String::from("│");
@@ -305,22 +407,34 @@ fn render_premium_table(raw_rows: &[&str]) -> Vec<ratatui::text::Line<'static>> 
             let val = row.get(col_idx).cloned().unwrap_or_default();
             line_content.push_str(&format!(" {:<width$} │", val, width = w));
         }
-        
+
         let style = if row_idx == 0 {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
-        result.push(ratatui::text::Line::from(ratatui::text::Span::styled(line_content, style)));
+        result.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+            line_content,
+            style,
+        )));
 
         // Separator after header
         if row_idx == 0 {
             let mut sep = String::from("├");
             for (idx, &w) in col_widths.iter().enumerate() {
                 sep.push_str(&"─".repeat(w + 2));
-                if idx < num_cols - 1 { sep.push('┼'); } else { sep.push('┤'); }
+                if idx < num_cols - 1 {
+                    sep.push('┼');
+                } else {
+                    sep.push('┤');
+                }
             }
-            result.push(ratatui::text::Line::from(ratatui::text::Span::styled(sep, Style::default().fg(Color::DarkGray))));
+            result.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+                sep,
+                Style::default().fg(Color::DarkGray),
+            )));
         }
     }
 
@@ -328,13 +442,19 @@ fn render_premium_table(raw_rows: &[&str]) -> Vec<ratatui::text::Line<'static>> 
     let mut bottom = String::from("└");
     for (idx, &w) in col_widths.iter().enumerate() {
         bottom.push_str(&"─".repeat(w + 2));
-        if idx < num_cols - 1 { bottom.push('┴'); } else { bottom.push('┘'); }
+        if idx < num_cols - 1 {
+            bottom.push('┴');
+        } else {
+            bottom.push('┘');
+        }
     }
-    result.push(ratatui::text::Line::from(ratatui::text::Span::styled(bottom, Style::default().fg(Color::DarkGray))));
+    result.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+        bottom,
+        Style::default().fg(Color::DarkGray),
+    )));
 
     result
 }
-
 
 fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -406,33 +526,37 @@ fn ui(f: &mut Frame, app: &App) {
     // If scroll_offset is 0, we stick to the bottom.
     let total_lines = messages_spans.len() as u16;
     let view_height = middle_chunks[0].height;
-    
+
     let scroll = if app.scroll_offset == 0 {
-        if total_lines > view_height - 2 {
-            total_lines - (view_height - 2)
-        } else {
-            0
-        }
+        total_lines.saturating_sub(view_height.saturating_sub(2))
     } else {
         app.scroll_offset
     };
 
     let messages_widget = Paragraph::new(messages_spans)
-        .block(Block::default().borders(Borders::ALL).title("Mensajes (↑/↓ para Scroll, Esc para salir)"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Mensajes (↑/↓ para Scroll, Esc para salir)"),
+        )
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(messages_widget, middle_chunks[0]);
 
-    // Trace log sidebar (UTC-6)
-    let mut trace_spans = Vec::new();
-    if let Ok(logs) = app.orchestrator.trace_log.lock() {
-        for log in logs.iter().rev() {
-            trace_spans.push(ratatui::text::Line::from(log.clone()));
-        }
-    }
+    // Trace log sidebar (UTC)
+    let trace_spans = app
+        .trace_log
+        .iter()
+        .rev()
+        .map(|log| ratatui::text::Line::from(log.clone()))
+        .collect::<Vec<_>>();
 
     let trace_widget = Paragraph::new(trace_spans)
-        .block(Block::default().borders(Borders::ALL).title("Trazabilidad (UTC-6)"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Trazabilidad (UTC)"),
+        )
         .style(Style::default().fg(Color::DarkGray))
         .wrap(Wrap { trim: true });
     f.render_widget(trace_widget, middle_chunks[1]);

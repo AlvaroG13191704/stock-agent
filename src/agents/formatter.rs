@@ -1,8 +1,8 @@
+use crate::agents::{Agent, AgentOutput, BaseAgent};
+use crate::models::Message;
+use crate::ollama::{ChatMessage, ChatRequest};
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::agents::{Agent, AgentOutput, BaseAgent};
-use crate::models::{Message};
-use crate::ollama::{ChatRequest, ChatMessage};
 
 pub struct FormatterAgent {
     pub base: BaseAgent,
@@ -20,17 +20,26 @@ impl Agent for FormatterAgent {
         &self.base.name
     }
 
-    async fn process(&self, messages: &[Message], context: &serde_json::Value) -> Result<AgentOutput> {
-         let mut chat_messages: Vec<ChatMessage> = Vec::new();
+    async fn process(
+        &self,
+        messages: &[Message],
+        context: &serde_json::Value,
+    ) -> Result<AgentOutput> {
+        let mut chat_messages: Vec<ChatMessage> = Vec::new();
         chat_messages.push(ChatMessage {
             role: "system".to_string(),
-            content: format!("{}\n\nContext for final formatting:\n{}", self.base.system_prompt, context),
+            content: format!(
+                "{}\n\nContext for final formatting:\n{}",
+                self.base.system_prompt, context
+            ),
             images: None,
         });
 
         for msg in messages {
             chat_messages.push(ChatMessage {
-                role: serde_json::to_string(&msg.role)?.trim_matches('"').to_string(),
+                role: serde_json::to_string(&msg.role)?
+                    .trim_matches('"')
+                    .to_string(),
                 content: msg.content.clone(),
                 images: None,
             });

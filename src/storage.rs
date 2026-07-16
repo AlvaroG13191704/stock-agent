@@ -1,11 +1,12 @@
-use sqlx::sqlite::{SqlitePool, SqliteConnectOptions};
-use sqlx::{Row};
-use anyhow::Result;
-use crate::models::{Conversation, Message, Role, UserProfile};
-use uuid::Uuid;
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
+use sqlx::Row;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
-use serde_json;
+use std::time::Duration;
+use uuid::Uuid;
+
+use crate::models::{Conversation, Message, Role, UserProfile};
 
 pub struct Storage {
     pool: SqlitePool,
@@ -14,70 +15,57 @@ pub struct Storage {
 impl Storage {
     pub async fn new(database_url: &str) -> Result<Self> {
         let options = SqliteConnectOptions::from_str(database_url)?
-            .create_if_missing(true);
-        let pool = SqlitePool::connect_with(options).await?;
-        
-        // Simple manual migrations for now
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS conversations (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                created_at DATETIME NOT NULL
-            )"
-        ).execute(&pool).await?;
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await?;
 
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS messages (
-                id TEXT PRIMARY KEY,
-                conversation_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                thinking TEXT,
-                created_at DATETIME NOT NULL,
-                FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-            )"
-        ).execute(&pool).await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
 
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS user_profiles (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                experience TEXT,
-                knowledge TEXT,
-                platforms TEXT,
-                holdings TEXT,
-                is_complete BOOLEAN DEFAULT FALSE
-            )"
-        ).execute(&pool).await?;
-
-        Ok(Self { pool })
+        let storage = Self { pool };
+        storage.recover_running_runs().await?;
+        Ok(storage)
     }
 
     pub async fn get_profile(&self) -> Result<UserProfile> {
-        let row = sqlx::query("SELECT experience, knowledge, platforms, holdings, is_complete FROM user_profiles WHERE id = 1")
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(
+            "SELECT experience, knowledge, platforms, holdings, is_complete
+             FROM user_profiles WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
 
-        match row {
-            Some(r) => {
-                let holdings_str: Option<String> = r.get("holdings");
-                let holdings: Option<Vec<String>> = holdings_str.and_then(|h| serde_json::from_str(&h).ok());
-                Ok(UserProfile {
-                    experience: r.get("experience"),
-                    knowledge: r.get("knowledge"),
-                    platforms: r.get("platforms"),
-                    holdings,
-                    is_complete: r.get("is_complete"),
-                })
-            }
-            None => Ok(UserProfile::default()),
-        }
+        let Some(row) = row else {
+            return Ok(UserProfile::default());
+        };
+
+        let holdings = row
+            .try_get::<Option<String>, _>("holdings")?
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .context("Stored user profile holdings are not valid JSON")
+            })
+            .transpose()?;
+
+        Ok(UserProfile {
+            experience: row.try_get("experience")?,
+            knowledge: row.try_get("knowledge")?,
+            platforms: row.try_get("platforms")?,
+            holdings,
+            is_complete: row.try_get("is_complete")?,
+        })
     }
 
     pub async fn save_profile(&self, profile: &UserProfile) -> Result<()> {
-        let holdings_json = serde_json::to_string(&profile.holdings.as_ref().unwrap_or(&vec![])).unwrap_or("[]".to_string());
+        let holdings_json = serde_json::to_string(profile.holdings.as_deref().unwrap_or(&[]))?;
+
         sqlx::query(
-            "INSERT OR REPLACE INTO user_profiles (id, experience, knowledge, platforms, holdings, is_complete)
-            VALUES (1, ?, ?, ?, ?, ?)"
+            "INSERT OR REPLACE INTO user_profiles
+             (id, experience, knowledge, platforms, holdings, is_complete)
+             VALUES (1, ?, ?, ?, ?, ?)",
         )
         .bind(&profile.experience)
         .bind(&profile.knowledge)
@@ -86,6 +74,7 @@ impl Storage {
         .bind(profile.is_complete)
         .execute(&self.pool)
         .await?;
+
         Ok(())
     }
 
@@ -96,32 +85,35 @@ impl Storage {
             created_at: Utc::now(),
         };
 
-        sqlx::query(
-            "INSERT INTO conversations (id, title, created_at) VALUES (?, ?, ?)"
-        )
-        .bind(conversation.id.to_string())
-        .bind(&conversation.title)
-        .bind(conversation.created_at)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("INSERT INTO conversations (id, title, created_at) VALUES (?, ?, ?)")
+            .bind(conversation.id.to_string())
+            .bind(&conversation.title)
+            .bind(conversation.created_at)
+            .execute(&self.pool)
+            .await?;
 
         Ok(conversation)
     }
 
     pub async fn list_conversations(&self) -> Result<Vec<Conversation>> {
-        let rows = sqlx::query("SELECT id, title, created_at FROM conversations ORDER BY created_at DESC")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(
+            "SELECT id, title, created_at
+             FROM conversations ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
 
-        let convs = rows.into_iter().map(|row| {
-            Conversation {
-                id: Uuid::parse_str(row.get(0)).unwrap(),
-                title: row.get(1),
-                created_at: row.get(2),
-            }
-        }).collect();
-
-        Ok(convs)
+        rows.into_iter()
+            .map(|row| {
+                let id: String = row.try_get(0)?;
+                Ok(Conversation {
+                    id: Uuid::parse_str(&id)
+                        .with_context(|| format!("Invalid conversation UUID in storage: {id}"))?,
+                    title: row.try_get(1)?,
+                    created_at: row.try_get(2)?,
+                })
+            })
+            .collect()
     }
 
     pub async fn delete_conversation(&self, id: Uuid) -> Result<()> {
@@ -134,41 +126,101 @@ impl Storage {
 
     pub async fn save_message(&self, msg: Message) -> Result<()> {
         sqlx::query(
-            "INSERT INTO messages (id, conversation_id, role, content, thinking, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT INTO messages
+             (id, conversation_id, role, content, thinking, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(msg.id.to_string())
         .bind(msg.conversation_id.to_string())
-        .bind(serde_json::to_string(&msg.role)?.trim_matches('"'))
+        .bind(role_to_db(&msg.role))
         .bind(&msg.content)
         .bind(&msg.thinking)
         .bind(msg.created_at)
         .execute(&self.pool)
         .await?;
+
         Ok(())
     }
 
     pub async fn get_messages(&self, conversation_id: Uuid) -> Result<Vec<Message>> {
         let rows = sqlx::query(
-            "SELECT id, conversation_id, role, content, thinking, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC"
+            "SELECT id, conversation_id, role, content, thinking, created_at
+             FROM messages WHERE conversation_id = ? ORDER BY created_at ASC",
         )
         .bind(conversation_id.to_string())
         .fetch_all(&self.pool)
         .await?;
 
-        let msgs = rows.into_iter().map(|row| {
-            let role_str: String = row.get(2);
-            let role: Role = serde_json::from_str(&format!("\"{}\"", role_str)).unwrap();
-            Message {
-                id: Uuid::parse_str(row.get(0)).unwrap(),
-                conversation_id: Uuid::parse_str(row.get(1)).unwrap(),
-                role,
-                content: row.get(3),
-                thinking: row.get(4),
-                created_at: row.get(5),
-            }
-        }).collect();
+        rows.into_iter()
+            .map(|row| {
+                let id: String = row.try_get(0)?;
+                let stored_conversation_id: String = row.try_get(1)?;
+                let role: String = row.try_get(2)?;
 
-        Ok(msgs)
+                Ok(Message {
+                    id: Uuid::parse_str(&id)
+                        .with_context(|| format!("Invalid message UUID in storage: {id}"))?,
+                    conversation_id: Uuid::parse_str(&stored_conversation_id).with_context(
+                        || {
+                            format!(
+                                "Invalid conversation UUID in message storage: {stored_conversation_id}"
+                            )
+                        },
+                    )?,
+                    role: role_from_db(&role)?,
+                    content: row.try_get(3)?,
+                    thinking: row.try_get(4)?,
+                    created_at: row.try_get(5)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn recover_running_runs(&self) -> Result<()> {
+        sqlx::query(
+            "UPDATE runs
+             SET status = 'failed',
+                 error = COALESCE(error, 'La aplicación se cerró antes de completar la ejecución.'),
+                 finished_at = ?
+             WHERE status = 'running'",
+        )
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn start_run(&self, run_id: Uuid, conversation_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO runs
+             (id, conversation_id, status, started_at)
+             VALUES (?, ?, 'running', ?)",
+        )
+        .bind(run_id.to_string())
+        .bind(conversation_id.to_string())
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn complete_run(&self, run_id: Uuid) -> Result<()> {
+        self.finish_run(run_id, "completed", None).await
+    }
+
+    pub async fn fail_run(&self, run_id: Uuid, error: &str) -> Result<()> {
+        self.finish_run(run_id, "failed", Some(error)).await
+    }
+
+    async fn finish_run(&self, run_id: Uuid, status: &str, error: Option<&str>) -> Result<()> {
+        sqlx::query("UPDATE runs SET status = ?, error = ?, finished_at = ? WHERE id = ?")
+            .bind(status)
+            .bind(error)
+            .bind(Utc::now())
+            .bind(run_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn delete_profile(&self) -> Result<()> {
@@ -176,5 +228,74 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+}
+
+fn role_to_db(role: &Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+}
+
+fn role_from_db(role: &str) -> Result<Role> {
+    match role {
+        "system" => Ok(Role::System),
+        "user" => Ok(Role::User),
+        "assistant" => Ok(Role::Assistant),
+        "tool" => Ok(Role::Tool),
+        other => Err(anyhow!("Unknown message role in storage: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn storage_should_round_trip_messages_and_runs() {
+        let path = std::env::temp_dir().join(format!("stock-agent-test-{}.db", Uuid::new_v4()));
+        let database_url = format!("sqlite:{}", path.display());
+        let storage = Storage::new(&database_url)
+            .await
+            .expect("test database should initialize");
+
+        let conversation = storage
+            .create_conversation("Test")
+            .await
+            .expect("conversation should be created");
+        storage
+            .save_message(Message {
+                id: Uuid::new_v4(),
+                conversation_id: conversation.id,
+                role: Role::User,
+                content: "hello".to_string(),
+                created_at: Utc::now(),
+                thinking: None,
+            })
+            .await
+            .expect("message should be saved");
+
+        let messages = storage
+            .get_messages(conversation.id)
+            .await
+            .expect("messages should be readable");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, Role::User);
+
+        let run_id = Uuid::new_v4();
+        storage
+            .start_run(run_id, conversation.id)
+            .await
+            .expect("run should start");
+        storage
+            .complete_run(run_id)
+            .await
+            .expect("run should complete");
+
+        drop(storage);
+        let _ = std::fs::remove_file(path);
     }
 }

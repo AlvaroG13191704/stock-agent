@@ -1,7 +1,8 @@
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use anyhow::{Context, Result, anyhow};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use anyhow::{Result, anyhow};
 use std::env;
+use std::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -58,74 +59,129 @@ pub struct OllamaClient {
 }
 
 impl OllamaClient {
-    pub fn new(base_url: String, api_key: Option<String>) -> Self {
-        Self {
-            base_url,
+    pub fn new(base_url: String, api_key: Option<String>) -> Result<Self> {
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
+            .build()
+            .context("Failed to build HTTP client")?;
+
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
-            http_client: reqwest::Client::new(),
-        }
+            http_client,
+        })
     }
 
     pub fn from_env() -> Result<Self> {
-        let base_url = env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".to_string());
+        let base_url =
+            env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".to_string());
         let api_key = env::var("OLLAMA_API_KEY").ok();
-        Ok(Self::new(base_url, api_key))
+        Self::new(base_url, api_key)
     }
 
     pub async fn chat(&self, req: ChatRequest) -> Result<ChatResponse> {
         let url = format!("{}/api/chat", self.base_url);
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(USER_AGENT, HeaderValue::from_static("StockAgent/1.0"));
-        
-        if let Some(key) = &self.api_key {
-            headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", key))?);
-        }
+        let headers = self.headers(true)?;
 
-        let res = self.http_client.post(url)
+        let response = self
+            .http_client
+            .post(url)
             .headers(headers)
             .json(&req)
             .send()
-            .await?;
+            .await
+            .context("Ollama chat request failed")?;
 
-        if !res.status().is_success() {
-            let status = res.status();
-            let err_text = res.text().await?;
-            return Err(anyhow!("Ollama API error {}: {}", status, err_text));
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .context("Failed to read Ollama error response")?;
+            return Err(anyhow!(
+                "Ollama API error {status}: {}",
+                truncate_for_error(&body)
+            ));
         }
 
-        let text = res.text().await?;
-        match serde_json::from_str::<ChatResponse>(&text) {
-            Ok(json) => Ok(json),
-            Err(e) => {
-                eprintln!("DEBUG: Failed to parse JSON. Body: {}", text);
-                Err(anyhow!("Failed to decode response: {}", e))
-            }
-        }
+        let body = response
+            .text()
+            .await
+            .context("Failed to read Ollama response")?;
+        serde_json::from_str::<ChatResponse>(&body).with_context(|| {
+            format!(
+                "Failed to decode Ollama response: {}",
+                truncate_for_error(&body)
+            )
+        })
     }
 
     pub async fn web_search(&self, query: String) -> Result<WebSearchResponse> {
         let url = "https://ollama.com/api/web_search";
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        
-        let api_key = self.api_key.as_ref().ok_or_else(|| anyhow!("OLLAMA_API_KEY is required for web search"))?;
-        headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", api_key))?);
+        let api_key = self
+            .api_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("OLLAMA_API_KEY is required for web search"))?;
+        let mut headers = self.headers(false)?;
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {api_key}"))?,
+        );
 
-        let req = WebSearchRequest { query, max_results: Some(5) };
+        let req = WebSearchRequest {
+            query,
+            max_results: Some(5),
+        };
 
-        let res = self.http_client.post(url)
+        let response = self
+            .http_client
+            .post(url)
             .headers(headers)
             .json(&req)
             .send()
-            .await?;
+            .await
+            .context("Ollama web search request failed")?;
 
-        if !res.status().is_success() {
-            let err_text = res.text().await?;
-            return Err(anyhow!("Ollama Web Search error: {}", err_text));
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .context("Failed to read Ollama web search error response")?;
+            return Err(anyhow!(
+                "Ollama web search error {status}: {}",
+                truncate_for_error(&body)
+            ));
         }
 
-        let search_res = res.json::<WebSearchResponse>().await?;
-        Ok(search_res)
+        response
+            .json::<WebSearchResponse>()
+            .await
+            .context("Failed to decode Ollama web search response")
     }
+
+    fn headers(&self, include_user_agent: bool) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if include_user_agent {
+            headers.insert(USER_AGENT, HeaderValue::from_static("StockAgent/1.0"));
+        }
+        if let Some(key) = &self.api_key {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {key}"))?,
+            );
+        }
+        Ok(headers)
+    }
+}
+
+fn truncate_for_error(value: &str) -> String {
+    const MAX_ERROR_BYTES: usize = 2_000;
+    if value.len() <= MAX_ERROR_BYTES {
+        return value.to_string();
+    }
+
+    format!("{}…", &value[..MAX_ERROR_BYTES])
 }

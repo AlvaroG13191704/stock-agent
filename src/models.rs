@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -48,7 +48,6 @@ pub struct StockAction {
     pub sources: Option<Vec<String>>,
     pub prices: Option<PriceHistory>,
 }
-
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PriceHistory {

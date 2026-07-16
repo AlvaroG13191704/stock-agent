@@ -1,7 +1,7 @@
-use anyhow::Result;
-use async_trait::async_trait;
 use crate::agents::{Agent, AgentOutput, BaseAgent};
 use crate::models::{Message, UserProfile};
+use anyhow::Result;
+use async_trait::async_trait;
 use serde_json::json;
 
 pub struct ProfileAgent {
@@ -14,7 +14,11 @@ impl ProfileAgent {
     }
 
     /// Determines if a profile should be updated based on a message
-    pub async fn update_profile_from_msg(&self, messages: &[Message], current_profile: &UserProfile) -> Result<UserProfile> {
+    pub async fn update_profile_from_msg(
+        &self,
+        messages: &[Message],
+        current_profile: &UserProfile,
+    ) -> Result<UserProfile> {
         let system_prompt = format!(
             "Eres un analista de perfiles. Analiza el diálogo y extrae información del perfil de inversión del usuario.\n\n\
             Perfil Actual: {:?}\n\n\
@@ -28,16 +32,14 @@ impl ProfileAgent {
             current_profile
         );
 
-        let mut chat_messages: Vec<crate::ollama::ChatMessage> = vec![
-            crate::ollama::ChatMessage {
-                role: "system".to_string(),
-                content: system_prompt,
-                images: None,
-            }
-        ];
+        let mut chat_messages: Vec<crate::ollama::ChatMessage> = vec![crate::ollama::ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+            images: None,
+        }];
 
         for msg in messages.iter().rev().take(5).rev() {
-             chat_messages.push(crate::ollama::ChatMessage {
+            chat_messages.push(crate::ollama::ChatMessage {
                 role: format!("{:?}", msg.role).to_lowercase(),
                 content: msg.content.clone(),
                 images: None,
@@ -73,15 +75,21 @@ impl Agent for ProfileAgent {
         &self.base.name
     }
 
-    async fn process(&self, _messages: &[Message], context: &serde_json::Value) -> Result<AgentOutput> {
+    async fn process(
+        &self,
+        _messages: &[Message],
+        context: &serde_json::Value,
+    ) -> Result<AgentOutput> {
         // Si estamos aquí, es porque el orquestador necesita información de perfil faltante
         let is_complete = context["is_complete"].as_bool().unwrap_or(false);
         if is_complete {
-            return Ok(AgentOutput::Text("Perfil listo. ¿En qué podemos ayudarte hoy?".to_string()));
+            return Ok(AgentOutput::Text(
+                "Perfil listo. ¿En qué podemos ayudarte hoy?".to_string(),
+            ));
         }
 
         let profile = &context["profile"];
-        
+
         let system_prompt = format!(
             "Eres un asistente de incorporación de inversiones amigable. Tu objetivo es completar el perfil del usuario en ESPAÑOL.\n\n\
             Perfil actual del usuario: {}\n\n\
