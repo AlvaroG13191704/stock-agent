@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use serde_json::json;
 use std::sync::Arc;
@@ -13,25 +13,112 @@ use crate::agents::investigation::{NewsSearcherAgent, StockDataAgent};
 use crate::agents::profile::ProfileAgent;
 use crate::agents::router::RouterAgent;
 use crate::agents::{Agent, AgentOutput, BaseAgent};
-use crate::events::RunEvent;
-use crate::models::{Message, Role};
+use crate::events::{RunEvent, TokenUsage};
+use crate::market_data::MarketDataProvider;
+use crate::models::{Message, QueryIntent, QueryPlan, Role, RouteDecision};
 use crate::ollama::OllamaClient;
 use crate::storage::Storage;
 
 const MAX_RUN_DURATION: Duration = Duration::from_secs(5 * 60);
+const FINANCIAL_DISCLAIMER: &str = "\n\n> **Aviso:** Este informe es únicamente educativo e informativo. No constituye asesoramiento financiero, fiscal o legal. Verifica los datos y considera tu situación y tolerancia al riesgo antes de tomar decisiones.";
+const OUT_OF_SCOPE_RESPONSE: &str = "Solo puedo ayudarte con educación financiera, mercados, acciones, ETFs, bonos, carteras, riesgo y datos económicos. No puedo resolver tareas ajenas al dominio, como preparar una pizza. Reformula tu pregunta desde una perspectiva financiera y estaré encantado de ayudarte.";
+
+pub(crate) fn is_retryable_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "timeout",
+        "timed out",
+        "request failed",
+        "connection",
+        "network",
+        "temporarily unavailable",
+        "returned 429",
+        "returned 500",
+        "returned 501",
+        "returned 502",
+        "returned 503",
+        "returned 504",
+        "api error 429",
+        "api error 5",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+pub(crate) fn is_obviously_out_of_scope(query: &str) -> bool {
+    let normalized = query.trim().to_ascii_lowercase();
+    let financial_context = [
+        "acción",
+        "acciones",
+        "stock",
+        "etf",
+        "bono",
+        "invert",
+        "ticker",
+        "mercado",
+        "cartera",
+        "portfolio",
+        "precio",
+        "cotización",
+        "financ",
+        "riesgo",
+        "dividendo",
+        "earnings",
+        "share",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    if financial_context {
+        return false;
+    }
+
+    [
+        "pizza",
+        "receta",
+        "cocina",
+        "cocinar",
+        "cocin",
+        "hornear",
+        "ingredientes para",
+        "weather",
+        "clima",
+        "fútbol",
+        "futbol",
+        "football",
+        "videojuego",
+        "videojuegos",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn truncate_for_trace(value: &str) -> String {
+    const MAX_TRACE_BYTES: usize = 1_500;
+    if value.len() <= MAX_TRACE_BYTES {
+        return value.to_string();
+    }
+    value.chars().take(MAX_TRACE_BYTES).collect::<String>() + "…"
+}
 
 pub struct Orchestrator {
     pub client: Arc<OllamaClient>,
     pub storage: Arc<Storage>,
     pub model: String,
+    pub market_data: Arc<dyn MarketDataProvider>,
 }
 
 impl Orchestrator {
-    pub fn new(client: Arc<OllamaClient>, storage: Arc<Storage>, model: String) -> Self {
+    pub fn new(
+        client: Arc<OllamaClient>,
+        storage: Arc<Storage>,
+        model: String,
+        market_data: Arc<dyn MarketDataProvider>,
+    ) -> Self {
         Self {
             client,
             storage,
             model,
+            market_data,
         }
     }
 
@@ -53,6 +140,7 @@ impl Orchestrator {
                 run_id,
                 conversation_id,
                 message,
+                retryable: is_retryable_error(&error),
             });
             return Err(error);
         }
@@ -76,6 +164,7 @@ impl Orchestrator {
                         run_id,
                         conversation_id,
                         message,
+                        retryable: is_retryable_error(&error),
                     });
                     return Err(error);
                 }
@@ -92,6 +181,7 @@ impl Orchestrator {
                     run_id,
                     conversation_id,
                     message: message.clone(),
+                    retryable: is_retryable_error(&error),
                 });
                 Err(error)
             }
@@ -103,6 +193,7 @@ impl Orchestrator {
                     run_id,
                     conversation_id,
                     message,
+                    retryable: true,
                 });
                 Err(error)
             }
@@ -128,12 +219,24 @@ impl Orchestrator {
         };
         self.storage.save_message(user_msg).await?;
 
+        if is_obviously_out_of_scope(&query) {
+            self.trace(
+                &event_tx,
+                run_id,
+                "🛡️ Guardrail: consulta fuera del dominio financiero; se bloquea el flujo de agentes.",
+            );
+            return self
+                .save_and_return_assistant_msg(conversation_id, OUT_OF_SCOPE_RESPONSE.to_string())
+                .await;
+        }
+
         let original_messages = self.storage.get_messages(conversation_id).await?;
         let mut profile = self.storage.get_profile().await?;
 
         let active_messages = if original_messages.len() > 10 {
             self.trace(&event_tx, run_id, "Comprimiendo contexto (>10 mensajes)...");
-            self.compress_context(&original_messages).await?
+            self.compress_context(&original_messages, run_id, &event_tx)
+                .await?
         } else {
             original_messages
         };
@@ -149,6 +252,7 @@ impl Orchestrator {
         );
 
         if !profile.is_complete {
+            self.stage(&event_tx, run_id, "Profile", 1, 5);
             self.trace(
                 &event_tx,
                 run_id,
@@ -198,31 +302,52 @@ impl Orchestrator {
             run_id,
             "🔀 Agente Router: Identificando intención...",
         );
+        self.stage(&event_tx, run_id, "Router", 2, 5);
         let router_out = router.process(&active_messages, &json!({})).await?;
-        let (intent, target_companies, requires_discovery, discovery_topic) = match router_out {
-            AgentOutput::Structured(data) => (
-                data["intent"].as_str().unwrap_or("educational").to_string(),
-                data["companies"]
-                    .as_array()
-                    .map(|companies| {
-                        companies
-                            .iter()
-                            .filter_map(|company| company.as_str())
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default(),
-                data["requires_discovery"].as_bool().unwrap_or(false),
-                data["discovery_topic"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-            ),
-            AgentOutput::Text(_) => ("educational".to_string(), Vec::new(), false, String::new()),
+        let decision: RouteDecision = match router_out {
+            AgentOutput::Structured(data) => serde_json::from_value(data.clone()).with_context(|| {
+                format!(
+                    "La respuesta del Router no cumple el esquema de ruta esperado. JSON recibido: {}",
+                    truncate_for_trace(&data.to_string())
+                )
+            })?,
+            AgentOutput::Text(_) => {
+                return Err(anyhow!("El Router no produjo una decisión estructurada."));
+            }
         };
-        self.trace(&event_tx, run_id, &format!("Intención detectada: {intent}"));
+        let plan = match decision.intent {
+            QueryIntent::Educational => QueryPlan::Educational,
+            QueryIntent::OutOfScope => QueryPlan::OutOfScope,
+            QueryIntent::Investigation => QueryPlan::Investigation {
+                companies: decision.companies,
+                discovery_topic: if decision.requires_discovery
+                    && !decision.discovery_topic.trim().is_empty()
+                {
+                    Some(decision.discovery_topic)
+                } else {
+                    None
+                },
+            },
+        };
+        self.trace(&event_tx, run_id, &format!("Plan detectado: {plan:?}"));
 
-        let final_content = if intent == "investigation" {
+        if matches!(&plan, QueryPlan::OutOfScope) {
+            self.trace(
+                &event_tx,
+                run_id,
+                "🛡️ Guardrail del Router: consulta fuera del dominio financiero.",
+            );
+            return self
+                .save_and_return_assistant_msg(conversation_id, OUT_OF_SCOPE_RESPONSE.to_string())
+                .await;
+        }
+
+        let final_content = if let QueryPlan::Investigation {
+            companies: target_companies,
+            discovery_topic,
+        } = plan
+        {
+            let requires_discovery = discovery_topic.is_some();
             let news_searcher = NewsSearcherAgent::new(
                 BaseAgent::new(
                     "NewsSearcher",
@@ -237,9 +362,10 @@ impl Orchestrator {
                     "StockData",
                     self.client.clone(),
                     &self.model,
-                    "Fetch historical prices.",
+                    "Fetch verified historical prices.",
                 )
                 .with_events(run_id, event_tx.clone()),
+                self.market_data.clone(),
             );
 
             self.trace(&event_tx, run_id, "🔍 Iniciando flujo de INVESTIGACIÓN...");
@@ -261,6 +387,7 @@ impl Orchestrator {
                 run_id,
                 &format!("Empresas a investigar: {companies_to_research:?}"),
             );
+            self.stage(&event_tx, run_id, "NewsSearcher", 3, 5);
             self.trace(
                 &event_tx,
                 run_id,
@@ -272,7 +399,7 @@ impl Orchestrator {
                     &json!({
                         "target_companies": companies_to_research,
                         "requires_discovery": requires_discovery,
-                        "discovery_topic": discovery_topic
+                        "discovery_topic": discovery_topic.unwrap_or_default()
                     }),
                 )
                 .await?;
@@ -281,6 +408,7 @@ impl Orchestrator {
                 AgentOutput::Text(_) => json!([]),
             };
 
+            self.stage(&event_tx, run_id, "MarketData", 4, 5);
             self.trace(
                 &event_tx,
                 run_id,
@@ -297,6 +425,7 @@ impl Orchestrator {
                 AgentOutput::Text(_) => json!([]),
             };
 
+            self.stage(&event_tx, run_id, "Formatter", 5, 5);
             self.trace(
                 &event_tx,
                 run_id,
@@ -307,11 +436,13 @@ impl Orchestrator {
                     "Formatter",
                     self.client.clone(),
                     &self.model,
-                    "Crea un resumen ejecutivo en Markdown premium. \
-                     IMPORTANTE:\n\
-                     1. Usa tablas formateadas profesionalmente.\n\
-                     2. Si el resultado tiene 'sources', incluye los links al final de cada análisis como [Fuente](url).\n\
-                     3. Sé directo y visualmente atractivo. Responde en ESPAÑOL.",
+                    r#"Crea un resumen ejecutivo en Markdown premium.
+IMPORTANTE:
+1. Usa tablas formateadas profesionalmente.
+2. Separa datos verificables, interpretación de noticias y riesgos.
+3. Incluye las fuentes con título, URL y fecha de recuperación.
+4. No inventes precios, fechas, monedas ni recomendaciones de compra/venta.
+Responde en ESPAÑOL."#,
                 )
                 .with_events(run_id, event_tx.clone()),
             );
@@ -328,6 +459,7 @@ impl Orchestrator {
                 }
             }
         } else {
+            self.stage(&event_tx, run_id, "Informer", 3, 4);
             self.trace(&event_tx, run_id, "🎓 Iniciando flujo EDUCATIVO...");
             let informer = InformerAgent::new(
                 BaseAgent::new(
@@ -343,7 +475,7 @@ impl Orchestrator {
                     "Formatter",
                     self.client.clone(),
                     &self.model,
-                    "Sintetiza la información educativa en ESPAÑOL.",
+                    "Sintetiza la información educativa en ESPAÑOL. No presentes la respuesta como asesoramiento financiero personalizado.",
                 )
                 .with_events(run_id, event_tx.clone()),
             );
@@ -358,6 +490,7 @@ impl Orchestrator {
                 AgentOutput::Structured(_) => String::new(),
             };
 
+            self.stage(&event_tx, run_id, "Formatter", 4, 4);
             self.trace(
                 &event_tx,
                 run_id,
@@ -373,8 +506,27 @@ impl Orchestrator {
             }
         };
 
-        self.save_and_return_assistant_msg(conversation_id, final_content)
-            .await
+        self.save_and_return_assistant_msg(
+            conversation_id,
+            format!("{final_content}{FINANCIAL_DISCLAIMER}"),
+        )
+        .await
+    }
+
+    fn stage(
+        &self,
+        event_tx: &UnboundedSender<RunEvent>,
+        run_id: Uuid,
+        agent: &str,
+        current: usize,
+        total: usize,
+    ) {
+        let _ = event_tx.send(RunEvent::Stage {
+            run_id,
+            agent: agent.to_string(),
+            current,
+            total,
+        });
     }
 
     fn trace(&self, event_tx: &UnboundedSender<RunEvent>, run_id: Uuid, message: &str) {
@@ -385,7 +537,12 @@ impl Orchestrator {
         });
     }
 
-    async fn compress_context(&self, messages: &[Message]) -> Result<Vec<Message>> {
+    async fn compress_context(
+        &self,
+        messages: &[Message],
+        run_id: Uuid,
+        event_tx: &UnboundedSender<RunEvent>,
+    ) -> Result<Vec<Message>> {
         const LIMIT: usize = 10;
         if messages.len() <= LIMIT {
             return Ok(messages.to_vec());
@@ -425,6 +582,13 @@ impl Orchestrator {
         };
 
         let response = self.client.chat(request).await?;
+        let usage = TokenUsage {
+            prompt_tokens: response.prompt_eval_count.unwrap_or_default(),
+            completion_tokens: response.eval_count.unwrap_or_default(),
+        };
+        if usage.total() > 0 {
+            let _ = event_tx.send(RunEvent::Usage { run_id, usage });
+        }
         let mut final_context = vec![Message {
             id: Uuid::new_v4(),
             conversation_id: messages[0].conversation_id,
@@ -455,5 +619,25 @@ impl Orchestrator {
         };
         self.storage.save_message(assistant_msg).await?;
         Ok(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_obviously_out_of_scope;
+
+    #[test]
+    fn guardrail_should_block_obvious_cooking_queries() {
+        assert!(is_obviously_out_of_scope("¿Cómo preparo una pizza?"));
+    }
+
+    #[test]
+    fn guardrail_should_allow_financial_queries() {
+        assert!(!is_obviously_out_of_scope(
+            "¿Qué riesgos tiene invertir en un ETF?"
+        ));
+        assert!(!is_obviously_out_of_scope(
+            "¿Qué perspectivas tiene Pizza Pizza como acción?"
+        ));
     }
 }

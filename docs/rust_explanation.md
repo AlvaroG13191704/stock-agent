@@ -38,19 +38,23 @@ Es el cerebro que coordina el flujo. Cada consulta recibe un `run_id`, un canal 
 1. **Compresión de Contexto**: Si hay más de 10 mensajes, llama al LLM para resumir la historia antigua, manteniendo solo los últimos mensajes "frescos" para no saturar la ventana de tokens (250k).
 2. **Perfilamiento**: Verifica si el perfil del usuario está completo. Si no, fuerza al `ProfileAgent` a hablar.
 3. **Enrutamiento**: El `RouterAgent` decide si la pregunta es "Educativa" o una "Investigación".
-4. **Pipeline Investigativo**: Si es investigación, ejecuta una cadena secuencial de agentes:
-   - `HoldingAnalyzer` -> `NewsSearcher` -> `StockData` -> `Formatter`.
+4. **Pipeline Investigativo**: Si es investigación, ejecuta una cadena de agentes:
+   - `NewsSearcher` -> `MarketDataProvider` (Finnhub con fallback Yahoo) -> `Formatter`.
+   - Si ambos proveedores fallan, `StockData` usa evidencia web para resolver candidatos de ticker y vuelve a probarlos.
 
 ## 5. Interfaz de Terminal (`ui.rs`)
 Utiliza `Ratatui` para renderizar la interfaz y `Crossterm` para capturar eventos del teclado.
-- **Event Loop**: Un bucle `while` que escucha teclas como `TAB` (cambiar conversación), `F2` (nuevo chat) o `Enter` (enviar mensaje).
+- **Event Loop**: Un loop asíncrono basado en `EventStream` y un tick periódico que escucha teclas como `TAB` (cambiar conversación), `F2` (nuevo chat) o `Enter` (enviar mensaje).
 - **Eventos de ejecución**: La UI recibe eventos con `run_id` mediante un canal asíncrono. Esto permite mostrar trazas, finalizar el estado de carga y mostrar errores sin consultar una traza global compartida.
 - **Cancelación**: Al salir, cambiar de conversación o borrar un chat, se cancela el run activo mediante `CancellationToken`.
 - **Async Execution**: Cuando envías un mensaje, se lanza una tarea asíncrona para que la interfaz no se congele mientras el agente piensa o busca en la web.
+- **Selección del terminal**: La TUI no activa mouse capture; la selección y copia se delegan al emulador de terminal.
 
 ## 6. Modelado de Datos (`models.rs`)
 Define estructuras claras usando **Serde** (`Serialize/Deserialize`).
 - Permite convertir objetos de Rust a JSON (para la API de Ollama o la DB) y viceversa con facilidad.
+- `RouteDecision` normaliza campos opcionales del Router sin ocultar intenciones desconocidas.
+- Los tests usan dobles deterministas en `test_support.rs`, sin credenciales ni llamadas de red.
 
 ---
 
@@ -59,7 +63,7 @@ Define estructuras claras usando **Serde** (`Serialize/Deserialize`).
 2. **UI envía query** -> `orchestrator.rs` registra el run y emite eventos de progreso.
 3. **Orquestador analiza perfil** -> Si falta info, pide al usuario.
 4. **Orquestador analiza intención** -> Decide qué agentes especializados usar.
-5. **Agentes buscan en Web** -> `OllamaClient` hace peticiones HTTP con timeouts.
-6. **Formateador une todo** -> Genera el Markdown final.
+5. **Evidencia y datos** -> `OllamaClient` obtiene noticias, mientras `FinnhubProvider` (o el fallback `YahooFinanceProvider`) obtiene precios verificables con timestamps, moneda, exchange y URL de origen.
+6. **Formateador une todo** -> Separa datos, interpretación y riesgos en Markdown e incluye un aviso financiero.
 7. **Run finaliza** -> Se registra como completado o fallido; la UI siempre libera el estado de carga.
 8. **UI renderiza** -> El usuario ve la respuesta y la trazabilidad en colores.

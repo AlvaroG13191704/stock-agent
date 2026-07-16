@@ -2,6 +2,12 @@
 name = "stock-local-agent"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Terminal multi-agent research assistant for educational market analysis"
+license = "MIT"
+readme = "README.md"
+keywords = ["rust", "tui", "llm", "agents", "market-data"]
+categories = ["command-line-utilities", "finance"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -14,7 +20,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "macros"
 anyhow = "1.0"
 thiserror = "1.0"
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 futures = "0.3"

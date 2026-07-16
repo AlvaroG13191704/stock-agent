@@ -1,19 +1,20 @@
-use crate::events::RunEvent;
+use crate::events::{RunEvent, TokenUsage};
 use crate::models::{Conversation, Message, Role};
 use crate::orchestrator::Orchestrator;
 use crate::storage::Storage;
 use anyhow::Result;
 use chrono::Utc;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use futures::StreamExt;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier, Style, Stylize},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use std::{io, sync::Arc};
@@ -25,6 +26,7 @@ pub struct App {
     orchestrator: Arc<Orchestrator>,
     storage: Arc<Storage>,
     input: String,
+    cursor: usize,
     messages: Vec<Message>,
     conversations: Vec<Conversation>,
     current_conv_id: Option<Uuid>,
@@ -34,6 +36,12 @@ pub struct App {
     event_tx: UnboundedSender<RunEvent>,
     event_rx: UnboundedReceiver<RunEvent>,
     trace_log: Vec<String>,
+    token_usage: TokenUsage,
+    stage: Option<(String, usize, usize)>,
+    error_message: Option<String>,
+    error_retryable: bool,
+    last_query: Option<String>,
+    last_failed_query: Option<String>,
     pub scroll_offset: u16,
 }
 
@@ -53,6 +61,7 @@ impl App {
             orchestrator,
             storage,
             input: String::new(),
+            cursor: 0,
             messages,
             conversations,
             current_conv_id,
@@ -62,6 +71,12 @@ impl App {
             event_tx,
             event_rx,
             trace_log: Vec::new(),
+            token_usage: TokenUsage::default(),
+            stage: None,
+            error_message: None,
+            error_retryable: false,
+            last_query: None,
+            last_failed_query: None,
             scroll_offset: 0,
         })
     }
@@ -82,6 +97,20 @@ impl App {
 
         let query = self.input.trim().to_string();
         self.input.clear();
+        self.cursor = 0;
+        self.last_query = Some(query.clone());
+        self.messages.push(Message {
+            id: Uuid::new_v4(),
+            conversation_id: conv_id,
+            role: Role::User,
+            content: query.clone(),
+            created_at: Utc::now(),
+            thinking: None,
+        });
+        self.error_message = None;
+        self.error_retryable = false;
+        self.token_usage = TokenUsage::default();
+        self.stage = None;
         self.is_loading = true;
         self.trace_log.clear();
 
@@ -123,6 +152,21 @@ impl App {
                         }
                     }
                 }
+                RunEvent::Usage { run_id, usage } => {
+                    if self.active_run == Some(run_id) {
+                        self.token_usage.add_assign(&usage);
+                    }
+                }
+                RunEvent::Stage {
+                    run_id,
+                    agent,
+                    current,
+                    total,
+                } => {
+                    if self.active_run == Some(run_id) {
+                        self.stage = Some((agent, current, total));
+                    }
+                }
                 RunEvent::Completed {
                     run_id,
                     conversation_id,
@@ -133,25 +177,26 @@ impl App {
                         self.is_loading = false;
                         self.active_run = None;
                         self.cancellation = None;
+                        self.stage = None;
+                        self.last_failed_query = None;
                     }
                 }
                 RunEvent::Failed {
                     run_id,
                     conversation_id,
                     message,
+                    retryable,
                 } => {
-                    if self.active_run == Some(run_id) {
+                    if self.active_run == Some(run_id)
+                        && self.current_conv_id == Some(conversation_id)
+                    {
                         self.is_loading = false;
                         self.active_run = None;
                         self.cancellation = None;
-                        self.messages.push(Message {
-                            id: Uuid::new_v4(),
-                            conversation_id,
-                            role: Role::System,
-                            content: format!("⚠️ No se pudo completar la consulta: {message}"),
-                            created_at: Utc::now(),
-                            thinking: None,
-                        });
+                        self.stage = None;
+                        self.error_message = Some(message);
+                        self.error_retryable = retryable;
+                        self.last_failed_query = self.last_query.clone();
                     }
                 }
             }
@@ -164,6 +209,77 @@ impl App {
         }
         self.active_run = None;
         self.is_loading = false;
+        self.stage = None;
+    }
+
+    pub fn insert_char(&mut self, character: char) {
+        self.input.insert(self.cursor, character);
+        self.cursor += character.len_utf8();
+    }
+
+    pub fn delete_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let previous = self.input[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.input.drain(previous..self.cursor);
+        self.cursor = previous;
+    }
+
+    pub fn delete_forward(&mut self) {
+        if self.cursor >= self.input.len() {
+            return;
+        }
+        let next = self.input[self.cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| self.cursor + index)
+            .unwrap_or(self.input.len());
+        self.input.drain(self.cursor..next);
+    }
+
+    pub fn move_cursor_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor = self.input[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+        }
+    }
+
+    pub fn move_cursor_right(&mut self) {
+        if self.cursor < self.input.len() {
+            self.cursor += self.input[self.cursor..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(0);
+        }
+    }
+
+    pub fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+    }
+
+    pub async fn retry_last_query(&mut self) -> Result<()> {
+        let Some(query) = self.last_failed_query.clone() else {
+            return Ok(());
+        };
+        self.input = query;
+        self.cursor = self.input.len();
+        self.send_message().await
+    }
+
+    pub fn dismiss_error(&mut self) {
+        self.error_message = None;
+        self.error_retryable = false;
+        self.last_failed_query = None;
     }
 
     pub async fn refresh_messages(&mut self) -> Result<()> {
@@ -196,100 +312,124 @@ impl App {
 }
 
 pub async fn run(orchestrator: Arc<Orchestrator>, storage: Arc<Storage>) -> Result<()> {
+    let mut app = App::new(orchestrator, storage).await?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(orchestrator, storage).await?;
+    let loop_result = run_loop(&mut terminal, &mut app).await;
+    let restore_result = restore_terminal(&mut terminal);
+    loop_result?;
+    restore_result?;
+    Ok(())
+}
+
+async fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> Result<()> {
+    let mut events = EventStream::new();
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
 
     loop {
         app.process_events();
         app.refresh_messages().await?;
-        terminal.draw(|f| ui(f, &app))?;
+        terminal.draw(|f| ui(f, app))?;
 
-        if event::poll(std::time::Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
-            match key.code {
-                KeyCode::Esc => {
-                    app.cancel_active_run();
+        tokio::select! {
+            maybe_event = events.next() => {
+                if let Some(Ok(Event::Key(key))) = maybe_event
+                    && handle_key_event(app, key).await?
+                {
                     break;
                 }
-                KeyCode::Enter => {
-                    app.send_message().await?;
-                }
-                KeyCode::Char(c) => {
-                    app.input.push(c);
-                }
-                KeyCode::Backspace => {
-                    app.input.pop();
-                }
-                KeyCode::Tab => {
-                    app.next_conv().await?;
-                }
-                KeyCode::F(2) => {
-                    app.cancel_active_run();
-                    let conv = app.storage.create_conversation("Nuevo Chat").await?;
-                    app.current_conv_id = Some(conv.id);
-                    app.conversations = app.storage.list_conversations().await?;
-                    app.messages = Vec::new();
-                    app.trace_log.clear();
-                }
-                KeyCode::Delete | KeyCode::F(4) => {
-                    app.cancel_active_run();
-                    if let Some(id) = app.current_conv_id {
-                        app.storage.delete_conversation(id).await?;
-                        app.conversations = app.storage.list_conversations().await?;
-                        app.current_conv_id = app.conversations.first().map(|c| c.id);
-                        if let Some(new_id) = app.current_conv_id {
-                            app.messages = app.storage.get_messages(new_id).await?;
-                        } else {
-                            app.messages = Vec::new();
-                        }
-                        app.trace_log.clear();
-                    }
-                }
-                KeyCode::Up => {
-                    if app.scroll_offset > 0 {
-                        app.scroll_offset -= 1;
-                    }
-                }
-                KeyCode::Down => {
-                    app.scroll_offset += 1;
-                }
-                KeyCode::PageUp => {
-                    app.scroll_offset = app.scroll_offset.saturating_sub(10);
-                }
-                KeyCode::PageDown => {
-                    app.scroll_offset = app.scroll_offset.saturating_add(10);
-                }
-                KeyCode::F(6) => {
-                    app.cancel_active_run();
-                    app.storage.delete_profile().await?;
-                    app.messages.push(Message {
-                            id: Uuid::new_v4(),
-                            conversation_id: app.current_conv_id.unwrap_or(Uuid::nil()),
-                            role: Role::System,
-                            content: "⚠️ Perfil Reiniciado. En la próxima consulta se volverá a pedir información si es necesario.".to_string(),
-                            created_at: Utc::now(),
-                            thinking: None,
-                        });
-                }
-                _ => {}
             }
+            _ = tick.tick() => {}
         }
     }
+    Ok(())
+}
 
+async fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
+    if key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        app.cancel_active_run();
+        return Ok(true);
+    }
+
+    if app.error_message.is_some() {
+        match key.code {
+            KeyCode::Char('r') if app.error_retryable => app.retry_last_query().await?,
+            KeyCode::Char('d') => app.dismiss_error(),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    match key.code {
+        KeyCode::Enter => app.send_message().await?,
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'u' => {
+            app.clear_input();
+        }
+        KeyCode::Char(c) => app.insert_char(c),
+        KeyCode::Backspace => app.delete_backward(),
+        KeyCode::Delete => app.delete_forward(),
+        KeyCode::Left => app.move_cursor_left(),
+        KeyCode::Right => app.move_cursor_right(),
+        KeyCode::Home => app.cursor = 0,
+        KeyCode::End => app.cursor = app.input.len(),
+        KeyCode::Tab => app.next_conv().await?,
+        KeyCode::F(2) => {
+            app.cancel_active_run();
+            let conv = app.storage.create_conversation("Nuevo Chat").await?;
+            app.current_conv_id = Some(conv.id);
+            app.conversations = app.storage.list_conversations().await?;
+            app.messages = Vec::new();
+            app.trace_log.clear();
+            app.dismiss_error();
+        }
+        KeyCode::F(4) => {
+            app.cancel_active_run();
+            if let Some(id) = app.current_conv_id {
+                app.storage.delete_conversation(id).await?;
+                app.conversations = app.storage.list_conversations().await?;
+                app.current_conv_id = app.conversations.first().map(|c| c.id);
+                app.messages = if let Some(new_id) = app.current_conv_id {
+                    app.storage.get_messages(new_id).await?
+                } else {
+                    Vec::new()
+                };
+                app.trace_log.clear();
+            }
+        }
+        KeyCode::Up => app.scroll_offset = app.scroll_offset.saturating_add(1),
+        KeyCode::Down => app.scroll_offset = app.scroll_offset.saturating_sub(1),
+        KeyCode::PageUp => app.scroll_offset = app.scroll_offset.saturating_add(10),
+        KeyCode::PageDown => app.scroll_offset = app.scroll_offset.saturating_sub(10),
+        KeyCode::F(6) => {
+            app.cancel_active_run();
+            app.storage.delete_profile().await?;
+            app.messages.push(Message {
+                id: Uuid::new_v4(),
+                conversation_id: app.current_conv_id.unwrap_or(Uuid::nil()),
+                role: Role::System,
+                content: "⚠️ Perfil reiniciado. En la próxima consulta se volverá a pedir información si es necesario.".to_string(),
+                created_at: Utc::now(),
+                thinking: None,
+            });
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-
     Ok(())
 }
 
@@ -457,117 +597,185 @@ fn render_premium_table(raw_rows: &[&str]) -> Vec<ratatui::text::Line<'static>> 
 }
 
 fn ui(f: &mut Frame, app: &App) {
+    let error_height = if app.error_message.is_some() { 3 } else { 1 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
-        .constraints(
-            [
-                Constraint::Length(3),
-                Constraint::Min(1),
-                Constraint::Length(3),
-            ]
-            .as_ref(),
-        )
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(error_height),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
         .split(f.area());
 
-    let title = if let Some(id) = app.current_conv_id {
-        app.conversations
-            .iter()
-            .find(|c| c.id == id)
-            .map(|c| c.title.as_str())
-            .unwrap_or("Stock Agent")
+    let title = app
+        .current_conv_id
+        .and_then(|id| {
+            app.conversations
+                .iter()
+                .find(|conversation| conversation.id == id)
+        })
+        .map(|conversation| conversation.title.as_str())
+        .unwrap_or("Stock Agent");
+    let status = if let Some((agent, current, total)) = &app.stage {
+        format!("{agent} {current}/{total}")
+    } else if app.is_loading {
+        "Pensando…".to_string()
     } else {
-        "Stock Agent"
+        "Listo".to_string()
     };
-
-    let header = Paragraph::new(format!(
-        "Chat: {} (Tab Switch, F2 Nuevo, F4 Borrar, F6 Reset Perfil, ESC Salir)",
-        title
-    ))
-    .style(Style::default().fg(Color::Yellow))
-    .block(Block::default().borders(Borders::ALL).title("Conversación"));
+    let usage = format!(
+        "tokens in: {} • out: {} • total: {}",
+        app.token_usage.prompt_tokens,
+        app.token_usage.completion_tokens,
+        app.token_usage.total()
+    );
+    let header_line = ratatui::text::Line::from(vec![
+        ratatui::text::Span::styled(format!(" {} ", title), Style::default().bold().cyan()),
+        ratatui::text::Span::raw("  "),
+        ratatui::text::Span::styled(status, Style::default().bold().yellow()),
+        ratatui::text::Span::raw("  "),
+        ratatui::text::Span::styled(usage, Style::default().dim()),
+    ]);
+    let header = Paragraph::new(header_line)
+        .block(Block::default().borders(Borders::ALL).title("Conversación"));
     f.render_widget(header, chunks[0]);
 
     let middle_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)].as_ref())
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
         .split(chunks[1]);
 
-    let mut messages_spans = Vec::new();
-    for m in &app.messages {
-        let role_label = match m.role {
-            Role::User => "Tú",
-            Role::Assistant => "Agente",
-            _ => "Sistema",
+    let mut message_lines = Vec::new();
+    for message in &app.messages {
+        let (label, style) = match message.role {
+            Role::User => ("❯ Tú", Style::default().bold().cyan()),
+            Role::Assistant => ("◆ Agente", Style::default().bold().green()),
+            _ => ("⚠ Sistema", Style::default().bold().yellow()),
         };
-        let color = match m.role {
-            Role::User => Color::Cyan,
-            Role::Assistant => Color::Green,
-            _ => Color::DarkGray,
-        };
-
-        messages_spans.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(
-                format!("{}: ", role_label),
-                Style::default().add_modifier(Modifier::BOLD).fg(color),
-            ),
+        message_lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+            label, style,
+        )));
+        message_lines.extend(format_markdown(&message.content));
+        message_lines.push(ratatui::text::Line::from(""));
+    }
+    if app.is_loading {
+        message_lines.push(ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled("◆ Agente ", Style::default().bold().green()),
+            ratatui::text::Span::styled("está trabajando…", Style::default().dim()),
         ]));
-
-        // Render Markdown content
-        let content_lines = format_markdown(&m.content);
-        for line in content_lines {
-            messages_spans.push(line);
-        }
-        messages_spans.push(ratatui::text::Line::from(""));
     }
 
-    // Auto-scroll logic:
-    // User can scroll with Up/Down/PgUp/PgDown.
-    // If scroll_offset is 0, we stick to the bottom.
-    let total_lines = messages_spans.len() as u16;
-    let view_height = middle_chunks[0].height;
-
-    let scroll = if app.scroll_offset == 0 {
-        total_lines.saturating_sub(view_height.saturating_sub(2))
-    } else {
-        app.scroll_offset
-    };
-
-    let messages_widget = Paragraph::new(messages_spans)
+    let view_height = middle_chunks[0].height.saturating_sub(2);
+    let inner_width = middle_chunks[0].width.saturating_sub(2).max(1);
+    let wrapped_lines = wrapped_line_count(&message_lines, inner_width);
+    let max_scroll = wrapped_lines.saturating_sub(view_height);
+    // scroll_offset is the distance from the bottom: zero always means latest.
+    let scroll = max_scroll.saturating_sub(app.scroll_offset);
+    let messages_widget = Paragraph::new(message_lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Mensajes (↑/↓ para Scroll, Esc para salir)"),
+                .title("Chat · ↑/↓ desplazar"),
         )
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(messages_widget, middle_chunks[0]);
 
-    // Trace log sidebar (UTC)
-    let trace_spans = app
-        .trace_log
-        .iter()
-        .rev()
-        .map(|log| ratatui::text::Line::from(log.clone()))
-        .collect::<Vec<_>>();
-
-    let trace_widget = Paragraph::new(trace_spans)
+    let trace_lines = if app.trace_log.is_empty() {
+        vec![ratatui::text::Line::from("Esperando eventos…".dim())]
+    } else {
+        app.trace_log
+            .iter()
+            .rev()
+            .map(|log| ratatui::text::Line::from(log.clone().dim()))
+            .collect::<Vec<_>>()
+    };
+    let trace_widget = Paragraph::new(trace_lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Trazabilidad (UTC)"),
+                .title("Progreso · UTC"),
         )
-        .style(Style::default().fg(Color::DarkGray))
         .wrap(Wrap { trim: true });
     f.render_widget(trace_widget, middle_chunks[1]);
 
-    let input_label = if app.is_loading {
-        "⏳ Procesando..."
+    if let Some(error) = &app.error_message {
+        let action = if app.error_retryable {
+            "r reintentar · d descartar"
+        } else {
+            "d descartar"
+        };
+        let error_widget = Paragraph::new(vec![
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                format!("⚠ Error: {error}"),
+                Style::default().bold().red(),
+            )),
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                action,
+                Style::default().yellow(),
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("La consulta falló"),
+        );
+        f.render_widget(error_widget, chunks[2]);
     } else {
-        "⌨️ Entrada (Enter para enviar)"
+        f.render_widget(Paragraph::new(""), chunks[2]);
+    }
+
+    let input_label = if app.is_loading {
+        "⏳ Procesando · Esc cancela"
+    } else {
+        "⌨ Entrada · Enter enviar · Ctrl+U limpiar"
     };
+    let input_area = chunks[3];
+    let inner_width = input_area.width.saturating_sub(2) as usize;
+    let horizontal_offset = input_horizontal_offset(app, inner_width);
     let input = Paragraph::new(app.input.as_str())
-        .style(Style::default().fg(Color::White))
-        .block(Block::default().borders(Borders::ALL).title(input_label));
-    f.render_widget(input, chunks[2]);
+        .style(Style::default().cyan())
+        .block(Block::default().borders(Borders::ALL).title(input_label))
+        .scroll((0, horizontal_offset as u16));
+    f.render_widget(input, input_area);
+    if inner_width > 0 {
+        let cursor_column = app.input[..app.cursor].chars().count();
+        let visible_column = cursor_column.saturating_sub(horizontal_offset);
+        let cursor_x = input_area.x + 1 + visible_column.min(inner_width.saturating_sub(1)) as u16;
+        f.set_cursor_position((cursor_x, input_area.y + 1));
+    }
+
+    let help = ratatui::text::Line::from(vec![
+        ratatui::text::Span::styled(" Tab ", Style::default().bold().cyan()),
+        ratatui::text::Span::styled("chat siguiente  ", Style::default().dim()),
+        ratatui::text::Span::styled("F2", Style::default().bold().cyan()),
+        ratatui::text::Span::styled(" nuevo  ", Style::default().dim()),
+        ratatui::text::Span::styled("F4", Style::default().bold().cyan()),
+        ratatui::text::Span::styled(" borrar  ", Style::default().dim()),
+        ratatui::text::Span::styled("Esc", Style::default().bold().cyan()),
+        ratatui::text::Span::styled(" salir", Style::default().dim()),
+    ]);
+    f.render_widget(Paragraph::new(help), chunks[4]);
+}
+
+fn input_horizontal_offset(app: &App, width: usize) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    let cursor_column = app.input[..app.cursor].chars().count();
+    cursor_column.saturating_sub(width.saturating_sub(1))
+}
+
+fn wrapped_line_count(lines: &[ratatui::text::Line<'_>], width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .map(|line| {
+            let characters = line.to_string().chars().count();
+            characters.max(1).div_ceil(width) as u16
+        })
+        .fold(0, u16::saturating_add)
 }

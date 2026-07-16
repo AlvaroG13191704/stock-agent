@@ -64,6 +64,8 @@ impl ProfileAgent {
         };
 
         let res = self.base.client.chat(req).await?;
+        self.base
+            .record_usage(res.prompt_eval_count, res.eval_count);
         let profile: UserProfile = crate::agents::parse_llm_json(&res.message.content)?;
         Ok(profile)
     }
@@ -115,6 +117,8 @@ impl Agent for ProfileAgent {
         };
 
         let res = self.base.client.chat(req).await?;
+        self.base
+            .record_usage(res.prompt_eval_count, res.eval_count);
         Ok(AgentOutput::Text(res.message.content))
     }
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
-use crate::events::RunEvent;
+use crate::events::{RunEvent, TokenUsage};
 use crate::models::Message;
 use crate::ollama::OllamaClient;
 
@@ -163,5 +163,19 @@ impl BaseAgent {
             run_id,
             message: format!("[{timestamp}] {}: {message}", self.name),
         });
+    }
+
+    pub fn record_usage(&self, prompt_tokens: Option<u64>, completion_tokens: Option<u64>) {
+        let (Some(run_id), Some(event_tx)) = (self.run_id, &self.event_tx) else {
+            return;
+        };
+
+        let usage = TokenUsage {
+            prompt_tokens: prompt_tokens.unwrap_or_default(),
+            completion_tokens: completion_tokens.unwrap_or_default(),
+        };
+        if usage.total() > 0 {
+            let _ = event_tx.send(RunEvent::Usage { run_id, usage });
+        }
     }
 }
